@@ -88,6 +88,10 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `analysis.py` | `analyze(asset, period, candles)` -> explainable verdict |
 | `smart_engine.py` | regime-aware engine (ADX + volatility + breakout), 0..1 confidence |
 | `backtest.py` | honest walk-forward test: hit-rate, CI, p-value, random control |
+| `research.py` | fast harness: precomputes features, tests 49 hypotheses with train/val/test + Bonferroni |
+| `randomwalk.py` | autocorrelation / variance-ratio diagnostics (is the feed predictable at all?) |
+| `edge.py` | per-pair hit-rate vs the payout breakeven, with CI and p-value |
+| `journal.py` | live signal journal: logs every signal and settles it win/loss on the real close |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -308,6 +312,28 @@ The remaining honest avenues, none of which candle indicators can reach:
 - **Far more data on long timeframes** (days/weeks at 5m+), then re-run
   `research.py`. Three hours is nowhere near enough.
 - **Exogenous data** (news, order flow, sentiment) — outside this feed entirely.
+
+## Live signal journal (`journal.py`)
+
+Records every signal the engines fire, then settles each one against the close
+of its expiry candle and reports a win-rate with a Wilson CI against the payout
+breakeven. This is the *forward* test — the backtest tools look at the past, the
+journal measures what actually happens from now on.
+
+    python journal.py --once                 # log current signals, settle done ones
+    python journal.py --watch                # loop forever (every 30s)
+    python journal.py --report               # show the track record
+    python journal.py --report --engine smart
+
+The dashboard runs the same loop in the background (`Hub._journal_loop`) and
+exposes it at `GET /api/journal`; the UI shows a "Track record" card.
+
+Settlement detail: a signal on (asset, period) at candle T enters at the next
+boundary and expires `expiry_candles` later. Win/loss is the close of the expiry
+candle vs the entry close — exactly what a binary option pays on. An unchanged
+price settles `flat` (a tie, not a loss); these are almost all non-OTC pairs
+while the real market is closed. `data/journal.db` is separate from the candle
+store, so it survives independently.
 
 ## Two engines: rule vs smart
 

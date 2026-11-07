@@ -26,6 +26,7 @@ from urllib.parse import urlparse, parse_qs
 
 from analysis import analyze
 from candle_store import CandleStore, MultiFeed, PERIODS, TIMEFRAMES, asset_catalog
+from journal import Journal, settle_open, summary as journal_summary
 
 PAGE = """<!doctype html>
 <html lang="en"><head>
@@ -131,6 +132,12 @@ PAGE = """<!doctype html>
       <div id="scanList"></div>
     </div>
     <div class="card"><h3>Candles <span id="ctf" class="mut"></span></h3><canvas id="chart"></canvas></div>
+  </div>
+  <div class="card" style="margin-top:16px">
+    <h3>Track record <span class="mut" style="font-size:12px">— every signal this bot has logged, settled on the real close</span></h3>
+    <div id="jStats" class="grid" style="margin-bottom:10px"></div>
+    <div id="jVerdict" class="mut" style="font-size:13px;margin-bottom:8px"></div>
+    <div id="jPairs"></div>
   </div>
   <div>
     <div class="card" style="margin-bottom:16px">
@@ -301,6 +308,35 @@ async function tick(){
   setTimeout(tick,1500);
 }
 function st(k,v){return '<div class="stat"><span class="mut">'+k+'</span><b>'+v+'</b></div>';}
+async function loadJournal(){
+  try{
+    const r=await fetch('/api/journal'); const j=await r.json();
+    const o=j.overall||{n:0,hit:0,lo:0,hi:0}, d=j.decisive||{n:0,hit:0,lo:0,hi:0};
+    const pc=x=>(x*100).toFixed(1)+'%';
+    document.getElementById('jStats').innerHTML=
+      st('settled',j.settled||0)+
+      st('win / loss',(j.wins||0)+' / '+(j.losses||0))+
+      st('flat ties',j.flats||0)+
+      st('open',j.open||0)+
+      st('hit-rate',pc(o.hit||0))+
+      st('decisive',pc(d.hit||0))+
+      st('breakeven',pc(j.breakeven||0.5405));
+    let v='';
+    if(!j.settled){v='No signals settled yet — the bot needs time to log and settle them. Check back later.';}
+    else if(j.verdict==='above'){v='🟢 Hit-rate is statistically ABOVE the payout breakeven.';}
+    else if(j.verdict==='below'){v='🔴 Hit-rate is statistically BELOW the payout breakeven — trading this loses money.';}
+    else {v='⚪ Not yet distinguishable from breakeven (needs many more settled signals).';}
+    if(j.settled && o.n) v+='  95% CI ['+pc(o.lo)+', '+pc(o.hi)+'] on n='+o.n+'.';
+    document.getElementById('jVerdict').textContent=v;
+    const pairs=(j.pairs||[]).filter(p=>p.n>=10).slice(0,12);
+    document.getElementById('jPairs').innerHTML = pairs.length ? pairs.map(p=>
+      '<div class="mut" style="font-size:12px;font-variant-numeric:tabular-nums">'+
+      p.asset+' '+(p.period>=60?(p.period/60)+'m':p.period+'s')+
+      ' — '+p.wins+'/'+p.n+' ('+pc(p.hit)+')</div>').join('')
+      : '<div class="mut" style="font-size:12px">no pair has 10+ settled signals yet</div>';
+  }catch(e){}
+}
+setInterval(loadJournal,10000);
 function tickCountdowns(){
   const now=Math.floor(Date.now()/1000);
   document.querySelectorAll('[data-in]').forEach(el=>{
@@ -341,7 +377,7 @@ boot(); window.addEventListener('resize',()=>{});
 class Hub:
     """Shared live state behind the HTTP handlers."""
 
-    def __init__(self, assets, periods, store, wait_instruments=75.0):
+    def __init__(self, assets, periods, store, wait_instruments=75.0, journal=None):
         self.store = store
         self.periods = list(periods)
         self.assets = list(assets)
@@ -354,6 +390,7 @@ class Hub:
         self.ready = threading.Event()
         self.error = ""
         self._wait = wait_instruments
+        self.journal = journal
         threading.Thread(target=self._boot, daemon=True).start()
 
     def _boot(self):
@@ -365,9 +402,27 @@ class Hub:
             self.instruments = self.feed.instruments
             self.ready.set()
             threading.Thread(target=self._tps_loop, daemon=True).start()
+            if self.journal is not None:
+                threading.Thread(target=self._journal_loop, daemon=True).start()
         except Exception as exc:  # surface, don't hang the server
             self.error = f"{type(exc).__name__}: {exc}"
             print("feed boot failed:", self.error, flush=True)
+
+    def _journal_loop(self):
+        """Record live signals and settle expired ones, in the background."""
+        from scan import scan_all
+        while True:
+            time.sleep(30)
+            try:
+                now = int(time.time())
+                settle_open(self.journal, self.store, now)
+                rep = scan_all(self.store, self.periods, "rule", top=0)
+                for row in rep["signals"]:
+                    cs = self.store.load(row["asset"], row["period"], limit=2)
+                    row["price"] = cs[-1][2] if cs else 0.0
+                    self.journal.add(row, "rule", now)
+            except Exception as exc:  # never let the journal kill the feed
+                print("journal loop error:", exc, flush=True)
 
     def _on_closed(self, asset, period, candle):
         pass  # hook for future alerts
@@ -450,6 +505,18 @@ class Handler(BaseHTTPRequestHandler):
             from scan import parse_periods, scan_all
             rep = scan_all(self.hub.store, parse_periods(spec), engine, top=top)
             return self._json(rep)
+        if u.path == "/api/journal":
+            q = parse_qs(u.query)
+            asset = (q.get("asset") or [""])[0]
+            engine = (q.get("engine") or ["rule"])[0]
+            try:
+                payout = float((q.get("payout") or ["0.85"])[0])
+            except ValueError:
+                payout = 0.85
+            if self.hub.journal is None:
+                return self._json({"logged": 0, "settled": 0, "open": 0,
+                                   "verdict": "disabled", "pairs": []})
+            return self._json(journal_summary(self.hub.journal, asset, engine, payout))
         if u.path == "/api/catalog":
             return self._json(self.hub.catalog())
         if u.path == "/api/analyze":
@@ -497,13 +564,16 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 12000)))
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--db", default=os.environ.get("CANDLE_DB", "data/candles.db"))
+    ap.add_argument("--journal", default=os.environ.get("JOURNAL_DB", "data/journal.db"),
+                    help="signal journal database ('' to disable)")
     args = ap.parse_args()
 
     store = CandleStore(args.db)
     assets = [a.strip() for a in args.assets.split(",") if a.strip()]
     periods = [int(p) for p in args.periods.split(",") if p.strip()] or PERIODS
 
-    hub = Hub(assets, periods, store)
+    journal = Journal(args.journal) if args.journal else None
+    hub = Hub(assets, periods, store, journal=journal)
     Handler.hub = hub
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"dashboard: http://{args.host}:{args.port}  "
