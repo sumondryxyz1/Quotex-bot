@@ -396,23 +396,43 @@ class Score:
         return self.wins / self.n if self.n else 0.0
 
 
-def score_rule(rule, panels: list[Panel], lo_i: int, hi_i: int) -> Score:
-    """Score a rule over the index window [lo_i, hi_i) of every panel."""
+def score_rule(rule, panels: list[Panel], lo_i: int, hi_i: int,
+               horizon: int = 1) -> Score:
+    """Score a rule over the index window [lo_i, hi_i) of every panel.
+
+    `horizon` is the expiry in candles: the trade enters at the close of the
+    signal candle and settles at the close `horizon` candles later — the same
+    close-to-close basis the live journal uses.
+    """
     s = Score()
     for p in panels:
         mask, direction = _generic(p, rule)
         n = len(p)
-        hi = min(hi_i, n - 1)          # need i+1 to exist
+        hi = min(hi_i, n - horizon)     # need i+horizon to exist
         for i in range(max(lo_i, 1), hi):
             if not mask[i]:
                 continue
-            move = p.c[i + 1] - p.o[i + 1]
+            move = p.c[i + horizon] - p.c[i]
             if move == 0:
                 continue
             s.n += 1
             won = (move > 0) if direction[i] > 0 else (move < 0)
             s.wins += 1 if won else 0
     return s
+
+
+def is_otc(asset: str) -> bool:
+    return asset.endswith("_otc")
+
+
+def flat_rate(panel: Panel, horizon: int = 1) -> float:
+    """Fraction of candles with no net move — a dead/closed-market pair."""
+    n = flat = 0
+    for i in range(len(panel) - horizon):
+        n += 1
+        if panel.c[i + horizon] == panel.c[i]:
+            flat += 1
+    return flat / n if n else 1.0
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +449,12 @@ def main():
                     help="min signals on test to accept a rule")
     ap.add_argument("--train-frac", type=float, default=0.6)
     ap.add_argument("--val-frac", type=float, default=0.2)
+    ap.add_argument("--horizon", type=int, default=1,
+                    help="expiry in candles (1 = next candle)")
+    ap.add_argument("--kind", choices=["all", "otc", "real"], default="all",
+                    help="restrict to OTC (synthetic) or real pairs")
+    ap.add_argument("--max-flat", type=float, default=0.5,
+                    help="drop pairs with more than this flat rate (dead/closed)")
     ap.add_argument("--list", action="store_true", help="list hypotheses and exit")
     ap.add_argument("--db", default="data/candles.db")
     args = ap.parse_args()
@@ -443,15 +469,25 @@ def main():
     store = CandleStore(args.db)
     assets = [r[0] for r in store._db.execute(
         "SELECT DISTINCT asset FROM candles WHERE period=?", (args.period,)).fetchall()]
-    panels = []
+    if args.kind == "otc":
+        assets = [a for a in assets if is_otc(a)]
+    elif args.kind == "real":
+        assets = [a for a in assets if not is_otc(a)]
+
+    panels, dropped_flat = [], 0
     for a in assets:
         cs = store.load(a, args.period, limit=20000)
         p = build_panel(a, args.period, cs)
-        if p:
-            panels.append(p)
+        if not p:
+            continue
+        if flat_rate(p, args.horizon) > args.max_flat:
+            dropped_flat += 1
+            continue
+        panels.append(p)
 
     if not panels:
-        print(f"no usable data for {PERIOD_LABEL.get(args.period, args.period)}")
+        print(f"no usable data for {PERIOD_LABEL.get(args.period, args.period)} "
+              f"(kind={args.kind})")
         return
 
     n = min(len(p) for p in panels)
@@ -460,16 +496,19 @@ def main():
     label = PERIOD_LABEL.get(args.period, f"{args.period}s")
     breakeven = 1.0 / (1.0 + args.payout)
 
-    print(f"\nresearch | {label} | {len(panels)} pairs | ~{n} candles/pair")
+    print(f"\nresearch | {label} | {len(panels)} pairs (kind={args.kind}) | ~{n} candles/pair")
+    if dropped_flat:
+        print(f"dropped {dropped_flat} dead pairs (flat rate > {args.max_flat:.0%})")
     print(f"split: train [0,{cut1}) val [{cut1},{cut2}) test [{cut2},{n})")
-    print(f"payout {args.payout * 100:.0f}% -> breakeven {breakeven * 100:.1f}%")
+    print(f"horizon {args.horizon} candle(s) | payout {args.payout * 100:.0f}% "
+          f"-> breakeven {breakeven * 100:.1f}%")
     print(f"{len(rules)} hypotheses tried (multiple-testing aware)\n")
 
     # selection on validation
     candidates = []
     all_val = []
     for name, rule in rules:
-        s = score_rule(rule, panels, cut1, cut2)
+        s = score_rule(rule, panels, cut1, cut2, args.horizon)
         if s.n >= args.min_val:
             all_val.append((name, rule, s))
             if s.hit() > breakeven:
@@ -497,7 +536,7 @@ def main():
 
     survived = 0
     for name, rule, sval in candidates:
-        st = score_rule(rule, panels, cut2, n)
+        st = score_rule(rule, panels, cut2, n, args.horizon)
         lo, hi = wilson(st.wins, st.n)
         pv = p_value(st.wins, st.n)
         ok = (st.n >= args.min_test and lo > breakeven and pv < bar)

@@ -104,6 +104,10 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `verify_feed.py` | proves the feed is live and explains OTC vs real |
 | `test_indicators.py` | indicator math checks (all pass) |
 | `test_signal_bot.py` | offline strategy replay on synthetic trends |
+| `test_smart_engine.py` | regime/confidence checks for the smart engine |
+| `test_scan.py` | scan / entry-plan checks |
+| `test_journal.py` | journal settle + Wilson checks |
+| `test_research.py` | research harness: scoring, horizon, flat/dead filters |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -276,7 +280,6 @@ collapsed on test (50.4%, 53.5%). At 2m, 6 cleared validation and all 6 failed
 test. This is textbook overfitting — the validation "wins" were noise.
 
 ### 2. `randomwalk.py` — the returns are a random walk
-
 Per-pair normalised returns, pooled over 62 pairs (128k returns at 5s):
 
 - autocorrelation at lags 1–10: all |z| < 2 (≈ 0)
@@ -297,6 +300,19 @@ had |z| > 3 (expected ~0.3% by chance; top was z = −2.07, i.e. noise).
 0 of 62 pairs had a hit-rate CI lower bound above the 85%-payout breakeven of
 54.1%. Most sat at 40–48%, i.e. at or below a coin flip. `backtest.py --compare`
 agrees: rule 47.5% (p=0.44), smart 53.4% (p=0.27), random control 46.7%.
+
+### 5. Expiry horizon — also nothing (2026-11-07)
+
+`research.py --horizon H` sweeps the expiry in candles. At 5s, horizons 1/2/3/5
+all behaved the same: one hypothesis (`rsi_extreme_20_80`) cleared validation
+(55.1%, 52.5%, 55.0%, 58.8%) and every time collapsed on the held-out test
+(48.0%, 46.6%). Longer expiries do not reveal hidden drift — the edge is not
+there at any horizon tested.
+
+Both `research.py` and `edge.py` now filter by `--kind {all,otc,real}` and drop
+dead pairs (`--max-flat`). Note the real (non-OTC) pairs are completely frozen
+while the market is closed — flat rate 1.00 — so any test on them is meaningless
+until market hours. Only the `_otc` (synthetic, always-on) pairs move 24/7.
 
 ### What this means
 

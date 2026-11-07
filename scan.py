@@ -72,9 +72,22 @@ def entry_plan(period: int, last_time: int, now: float,
     }
 
 
+def _is_dead(candles: list[list], window: int = 20) -> bool:
+    """True if the last `window` candles never moved — a closed/illiquid pair.
+
+    Real-market pairs (non-OTC) stop ticking when the market is shut, so their
+    candles have identical open/close. Scanning them yields only flat signals.
+    """
+    if len(candles) < window:
+        return False
+    tail = candles[-window:]
+    return all(c[1] == c[2] for c in tail)
+
+
 def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
              top: int = 0, include_neutral: bool = False,
-             min_candles: int = 0, expiry_candles: int = 1) -> dict:
+             min_candles: int = 0, expiry_candles: int = 1,
+             skip_dead: bool = True) -> dict:
     """Run the engine over every (pair, timeframe) and return a ranked report.
 
     Returns a plain dict so the dashboard, the CLI, and the alert loop can all
@@ -82,13 +95,19 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
     `ready` / `waiting` count series with and without enough candles. Every row
     carries an entry/expiry plan (see `entry_plan`) so the caller knows *when*
     the signal is meant to be taken, not just its direction.
+
+    `skip_dead` drops pairs whose last N candles never moved (real-market pairs
+    while the market is closed). They produce only flat, meaningless signals.
     """
     fn = analyze_smart if engine == "smart" else analyze
     pairs = store.series(min_candles=min_candles, periods=periods)
     now = time.time()
-    fired, waiting = [], 0
+    fired, waiting, dead = [], 0, 0
     for asset, period in pairs:
         cs = store.load(asset, period, limit=5000)
+        if skip_dead and _is_dead(cs):
+            dead += 1
+            continue
         res = fn(asset, period, cs)
         if not res.enough:
             waiting += 1
@@ -119,6 +138,7 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
         "scanned": len(pairs),
         "ready": len(fired),
         "waiting": waiting,
+        "dead": dead,
         "signal_count": len(signals),
         "signals": [row(r, t) for r, t in (rows[:top] if top else rows)],
     }
@@ -141,7 +161,8 @@ def _print_report(rep: dict, top: int):
     multi = len(rep["periods"]) > 1
     scope = "all timeframes" if len(rep["periods"]) == len(PERIODS) else labels
     print(f"\n=== scan {scope} | engine {rep['engine']} | "
-          f"{rep['scanned']} series ({rep['ready']} ready, {rep['waiting']} collecting)"
+          f"{rep['scanned']} series ({rep['ready']} ready, {rep['waiting']} collecting"
+          f"{', ' + str(rep.get('dead', 0)) + ' dead' if rep.get('dead') else ''})"
           f" | {rep['signal_count']} signals | now {_clock(rep['now'])} ===")
     if not rep["signals"]:
         print("  no signal above threshold right now "

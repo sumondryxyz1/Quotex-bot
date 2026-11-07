@@ -69,10 +69,15 @@ def make_engine(name: str, asset: str):
 
 
 def run(store: CandleStore, period: int, engine_name: str,
-        min_signals: int, payout: float, warmup: int = 60):
+        min_signals: int, payout: float, warmup: int = 60,
+        kind: str = "all", horizon: int = 1):
     breakeven = 1.0 / (1.0 + payout)
     assets = [r[0] for r in store._db.execute(
         "SELECT DISTINCT asset FROM candles WHERE period=?", (period,)).fetchall()]
+    if kind == "otc":
+        assets = [a for a in assets if a.endswith("_otc")]
+    elif kind == "real":
+        assets = [a for a in assets if not a.endswith("_otc")]
 
     rows = []
     for a in assets:
@@ -81,11 +86,11 @@ def run(store: CandleStore, period: int, engine_name: str,
             continue
         ev = make_engine(engine_name, a)
         n = w = 0
-        for i in range(warmup, len(cs) - 1):
+        for i in range(warmup, len(cs) - horizon):
             sig = ev(cs[:i + 1])
             if sig is None:
                 continue
-            move = cs[i + 1][2] - cs[i + 1][1]
+            move = cs[i + horizon][2] - cs[i][2]   # close-to-close, like the journal
             if move == 0:
                 continue
             n += 1
@@ -96,8 +101,9 @@ def run(store: CandleStore, period: int, engine_name: str,
             rows.append((a, n, w / n, lo, hi, p_value(w, n)))
 
     label = PERIOD_LABEL.get(period, f"{period}s")
-    print(f"\nedge finder | {label} | {engine_name} engine | "
-          f"breakeven at {payout * 100:.0f}% payout = {breakeven * 100:.1f}%\n")
+    print(f"\nedge finder | {label} | {engine_name} engine | kind={kind} | "
+          f"horizon {horizon} | breakeven at {payout * 100:.0f}% payout = "
+          f"{breakeven * 100:.1f}%\n")
     if not rows:
         print(f"  no pair had >= {min_signals} signals on {label} yet.")
         print("  collect more candles, or lower --min-signals.\n")
@@ -128,12 +134,16 @@ def main():
     ap.add_argument("--period", type=int, default=60)
     ap.add_argument("--engine", choices=["rule", "smart"], default="smart")
     ap.add_argument("--min-signals", type=int, default=20)
+    ap.add_argument("--horizon", type=int, default=1,
+                    help="expiry in candles (close-to-close)")
+    ap.add_argument("--kind", choices=["all", "otc", "real"], default="all")
     ap.add_argument("--payout", type=float, default=0.85,
                     help="broker payout, e.g. 0.85 for 85%%")
     ap.add_argument("--db", default="data/candles.db")
     args = ap.parse_args()
     store = CandleStore(args.db)
-    run(store, args.period, args.engine, args.min_signals, args.payout)
+    run(store, args.period, args.engine, args.min_signals, args.payout,
+        kind=args.kind, horizon=args.horizon)
 
 
 if __name__ == "__main__":
