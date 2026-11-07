@@ -95,7 +95,9 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `selective.py` | sweeps selectivity knobs (threshold/regime/vol/MTF) to see if precision improves |
 | `golive.py` | demo→real readiness gate + paper account (never trades) |
 | `smc.py` | Smart Money Concepts primitives: swings, structure, liquidity sweep, order block, FVG |
-| `ensemble.py` | 3-model confluence engine (SMC + trend + momentum, ≥2 agree + trend gate) |
+| `ensemble.py` | 3-model confluence engine (SMC + trend + momentum, ≥2 agree + trend gate; `--patterns` adds a 4th chart-pattern vote) |
+| `patterns.py` | classical chart patterns: H&S, double top/bottom, triangles, S/R price action, flag |
+| `ai_ensemble.py` | train 3 model families (GBM/RF/logit), majority vote + trend gate, honest time-split score |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -115,6 +117,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_selective.py` | selectivity helpers: wilson, regime, MTF trend, ATR |
 | `test_golive.py` | paper account + go-live gate criteria |
 | `test_ensemble.py` | SMC primitives + 3-model ensemble (trend gate, ≥2 votes) |
+| `test_patterns.py` | chart-pattern detectors + control that AI learns a real pattern |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -370,6 +373,48 @@ genuinely different, structure-based rule set. Do not expect SMC to fix it.
 `ensemble` is wired into `backtest.py --ensemble`, `edge.py --engine ensemble`,
 `scan.py --engine ensemble`, and the dashboard engine selector, so it can be
 compared live and on the journal.
+
+### 8. Chart patterns + trained AI models — still no edge (2026-11-07)
+
+Tested the remaining structural ideas: classical chart patterns and three
+genuinely different trained model families.
+
+**Chart patterns** (`patterns.py`) — head & shoulders, inverse H&S, double
+top/bottom, ascending/descending triangle, S/R price action (rejection wick vs
+level break), flag/pennant. Every detector is pivot-based and look-ahead free.
+Held-out last 40% of every OTC pair:
+
+    60s  H&S       n=   39  hit 43.6%  p=0.42
+    60s  double    n= 2501  hit 51.7%  p=0.10
+    60s  triangle  n= 1396  hit 50.6%  p=0.67
+    60s  S/R PA    n=  630  hit 53.0%  p=0.13
+    15s  double    n=10276  hit 50.1%  p=0.91
+    15s  S/R PA    n= 1787  hit 50.9%  p=0.44
+    all patterns combined: 60s 51.3% (p=0.16), 15s 50.2% (p=0.72)
+
+No pattern is significant. S/R price action at 53% on 60s is the closest, but
+with n=630 the CI still includes the 54.1% breakeven, so it is not usable.
+
+**Three trained AI models** (`ai_ensemble.py`) — GradientBoosting, RandomForest
+and LogisticRegression on the same 26 features, strict time split (train first
+60%, test last 40% per pair), then vote:
+
+    15s  gbm 50.3%  rf 50.0%  logit 50.0%
+         2-of-3 50.0%   2-of-3 + trend gate 50.6%   3-of-3 50.3%
+     5s  gbm 49.7%  rf 50.0%  logit 50.4%
+         2-of-3 49.7%   2-of-3 + trend gate 50.5%   3-of-3 50.4%
+
+Three different model families, trained on 22k–37k rows, all converge on 50%.
+Adding the pattern vote as a 4th model changes nothing (15s: 50.5%).
+
+**Control that proves the pipeline works:** on synthetic momentum data (a real
+pattern) the same 3-model setup reaches **80.6%** and the test asserts >65%.
+So the code learns when a pattern exists. On this feed there is no pattern to
+learn — the model is not the problem, the data is.
+
+Conclusion: patterns and trained AI are the same story as indicators, thresholds,
+SMC and confluence. Random walk in, coin flip out. The bottleneck is the data,
+not the method.
 
 ### What this means
 

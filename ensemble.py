@@ -50,6 +50,7 @@ class EnsembleStrategy:
     min_agree: int = 2
     require_trend: bool = True     # hard trend-direction gate
     cooldown_candles: int = 5
+    use_patterns: bool = False     # add chart-pattern vote as a 4th model
 
     def min_candles(self) -> int:
         return max(self.ema_trend, self.macd_slow + self.macd_signal,
@@ -70,7 +71,7 @@ class EnsembleSignal:
 
     @property
     def confidence(self) -> float:
-        return self.score / 3.0
+        return self.score / max(1, len(self.votes))
 
 
 class EnsembleEngine:
@@ -146,25 +147,31 @@ class EnsembleEngine:
         s_vote, s_reasons = smc.smc_vote(opens, closes, highs, lows, i)
 
         votes = {"trend": t_vote, "smc": s_vote, "momentum": m_vote}
+        reasons_by_model = {"trend": t_reason, "smc": ", ".join(s_reasons),
+                            "momentum": m_reason}
+        if s.use_patterns:
+            import patterns as _p
+            p_vote, p_reasons = _p.pattern_vote(opens, closes, highs, lows, i)
+            votes["pattern"] = p_vote
+            reasons_by_model["pattern"] = ", ".join(p_reasons)
+
+        need = s.min_agree if not s.use_patterns else max(2, s.min_agree)
         bull = sum(1 for v in votes.values() if v == "CALL")
         bear = sum(1 for v in votes.values() if v == "PUT")
-        if max(bull, bear) < s.min_agree:
+        if max(bull, bear) < need:
             return None
-        action = "CALL" if bull > bear else "PUT"
         if bull == bear:
             return None
+        action = "CALL" if bull > bear else "PUT"
 
         # hard trend-direction gate: never trade against the trend
         if s.require_trend and t_vote != action:
             return None
 
         reasons = []
-        if t_vote == action:
-            reasons.append(f"trend: {t_reason}")
-        if s_vote == action:
-            reasons.append(f"smc: {', '.join(s_reasons)}")
-        if m_vote == action:
-            reasons.append(f"momentum: {m_reason}")
+        for model, v in votes.items():
+            if v == action:
+                reasons.append(f"{model}: {reasons_by_model[model]}")
 
         self._last_action = action
         self._last_index = i
@@ -179,7 +186,7 @@ def format_signal(sig: EnsembleSignal, asset: str = "") -> str:
                           for k, v in sig.votes.items())
     return (f"\n{'=' * 62}\n{head}\n"
             f"  candle close : {ts}\n"
-            f"  votes        : {vote_line}  ({sig.score}/3 agree)\n"
+            f"  votes        : {vote_line}  ({sig.score}/{len(sig.votes)} agree)\n"
             f"  reasons      : {' | '.join(sig.reasons)}\n"
             f"{'=' * 62}")
 
@@ -190,6 +197,8 @@ def main():
     ap.add_argument("period", nargs="?", type=int, default=60)
     ap.add_argument("--min-agree", type=int, default=2)
     ap.add_argument("--no-trend-gate", action="store_true")
+    ap.add_argument("--patterns", action="store_true",
+                    help="add chart patterns (H&S, double top/bottom, S/R, flag) as a 4th vote")
     ap.add_argument("--ssid", default="")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
@@ -197,7 +206,8 @@ def main():
     from market_qx_candles import CandleBuilder, MarketQX
 
     strat = EnsembleStrategy(min_agree=args.min_agree,
-                             require_trend=not args.no_trend_gate)
+                             require_trend=not args.no_trend_gate,
+                             use_patterns=args.patterns)
     engine = EnsembleEngine(strat)
     history: list[list] = []
     stats = {"candles": 0, "signals": 0}
