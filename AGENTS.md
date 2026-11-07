@@ -257,24 +257,57 @@ port work without changes.
 
 ## Honest evaluation: signals have no measured edge
 
-`edge.py` walks each (pair, timeframe) forward and scores signals against the
-next candle, reporting hit-rate + 95% CI + binomial p-value per pair. A binary
-option breaks even at `1/(1+payout)` — ~54.1% at 85% payout, ~52.6% at 90%.
+Three independent tools now agree that this feed is not tradable with candle
+indicators. Read this before adding any more indicators.
 
-Measured on the collected data (5s, smart engine, 62 pairs):
+### 1. `research.py` — 49 hypotheses, proper train/val/test
 
-- **0 of 62 pairs** have a CI lower bound above the payout breakeven.
-- Hit-rates cluster around 40–48% — i.e. at or below a coin flip.
-- ~3 pairs sat at p<0.05 below 50%, which is exactly the false-positive count
-  expected from testing 62 pairs, so even those are noise, not "inverted edge".
+Precomputes each pair's features once, then tests 49 hypotheses (streaks, RSI
+extremes, range fade, Bollinger, MACD/Stoch crosses, breakouts, hour-of-day,
+always-CALL/PUT) with a time split and a Bonferroni bar on the held-out test set.
 
-`backtest.py --compare` says the same: rule ~47.5% (p=0.44), smart ~53.4%
-(p=0.27), random control ~46.7%. Confidence is **not** calibrated either — the
-0.7–0.8 bucket hit 50%.
+Result across 5s/15s/30s/1m/2m: **0 hypotheses survived out-of-sample.** At 1m,
+2 cleared validation (body_reversal 55.1%, rsi_extreme_30_70 54.5%) and both
+collapsed on test (50.4%, 53.5%). At 2m, 6 cleared validation and all 6 failed
+test. This is textbook overfitting — the validation "wins" were noise.
 
-Conclusion: the signals are presentation, not a tradable edge. Do not trade them
-as-is. Use the dashboard for data collection and study, and re-run `edge.py`
-after collecting far more candles on longer timeframes before trusting anything.
+### 2. `randomwalk.py` — the returns are a random walk
+
+Per-pair normalised returns, pooled over 62 pairs (128k returns at 5s):
+
+- autocorrelation at lags 1–10: all |z| < 2 (≈ 0)
+- variance ratio: 0.997 / 0.991 / 0.997 at q = 2/5/10 (a random walk is 1.0)
+- direction base rate: up 47.1% / down 46.9% / flat 6.1%
+
+There is no linear structure to exploit. Note: pooling raw (un-normalised)
+returns across pairs *fakes* significance because pairs have wildly different
+price scales — always normalise per pair first.
+
+### 3. Cross-pair lead-lag — nothing
+
+Correlating one pair's move against another's next move: 0 of 30 ordered pairs
+had |z| > 3 (expected ~0.3% by chance; top was z = −2.07, i.e. noise).
+
+### 4. `edge.py` — no pair beats the payout
+
+0 of 62 pairs had a hit-rate CI lower bound above the 85%-payout breakeven of
+54.1%. Most sat at 40–48%, i.e. at or below a coin flip. `backtest.py --compare`
+agrees: rule 47.5% (p=0.44), smart 53.4% (p=0.27), random control 46.7%.
+
+### What this means
+
+A binary option breaks even at `1/(1+payout)` — 54.1% at 85% payout. The feed
+delivers ~50% and no rule tested moves that. Confidence is not calibrated either
+(the 0.7–0.8 bucket hit 50%). The signals are presentation, not an edge.
+
+The remaining honest avenues, none of which candle indicators can reach:
+
+- **Non-OTC pairs during real market hours** — genuine FX microstructure exists,
+  but it is weak and heavily arbitraged; OTC (what most of this data is) is
+  synthetic and deliberately unpredictable.
+- **Far more data on long timeframes** (days/weeks at 5m+), then re-run
+  `research.py`. Three hours is nowhere near enough.
+- **Exogenous data** (news, order flow, sentiment) — outside this feed entirely.
 
 ## Two engines: rule vs smart
 
