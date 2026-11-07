@@ -40,13 +40,14 @@ python scan.py 5                   # scan 5s pairs
 python scan.py --all-tf --top 12   # every timeframe
 python scan.py 60 --expiry 3       # 3-candle expiry
 python alerts.py --periods all --engine smart   # Telegram loop
+python journal.py --report         # your live track record
+python golive.py --report          # demo -> real money readiness gate
 ```
 
 ## Tests
 
 ```bash
-for t in test_indicators.py test_signal_bot.py test_smart_engine.py test_scan.py; do
-  .venv/bin/python "$t"; done
+for t in test_*.py; do .venv/bin/python "$t"; done
 ```
 
 ## Notes
@@ -55,4 +56,10 @@ for t in test_indicators.py test_signal_bot.py test_smart_engine.py test_scan.py
   the same host — the second one gets no data.
 - Signals are statistical hints, not advice. Nothing here places trades.
 
-See [AGENTS.md](AGENTS.md) for the full architecture.
+## Going from demo to real money
+
+Run it on demo, let `journal.py` settle signals, then ask `golive.py` whether the
+measured edge justifies real money. The dashboard shows the verdict live. It
+stays **NOT READY** until the demo record is statistically real — treat that as a
+feature, not a bug. See [AGENTS.md](AGENTS.md) for the exact criteria and the
+full architecture.
