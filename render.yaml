@@ -1,0 +1,23 @@
+# Render Blueprint — deploys the dashboard and keeps the candle/tick history.
+#
+# The dashboard process already collects ticks (MultiFeed buffers and flushes
+# them), so no separate worker is needed. The persistent disk is what matters:
+# without it every redeploy wipes data/candles.db, i.e. the whole track record.
+services:
+  - type: web
+    name: quotex-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter          # free instances sleep and drop the websocket feed
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 12000
+      - key: CANDLE_DB
+        value: /data/candles.db
+      - key: JOURNAL_DB
+        value: /data/journal.db
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
