@@ -1,0 +1,633 @@
+# 🔍 Quotex AI Trading Signal Bot — সম্পূর্ণ Technical Audit Report
+
+**তারিখ:** 2026-11-07
+**Repo:** `sumondryxyz1/Quotex-bot` · **Commit:** `12a15ee`
+**Live:** https://quotex-bot-jwem.onrender.com/
+**কোড:** ~7,513 লাইন, ৪২টি `.py` ফাইল, ৪৭টি test function
+
+> **অডিটের মূল নীতি:** প্রতিটি দাবির সাথে file + function + line দেওয়া আছে।
+> যা কোডে নেই, তা "নেই" বলা হয়েছে। যা পরীক্ষা করা হয়নি, তার win-rate বানানো হয়নি।
+> সব সংখ্যা বাস্তব `data/candles.db` ও `data/journal.db` এবং চালানো script-এর output থেকে।
+
+---
+
+## সূচিপত্র
+
+1. Project Overview
+2. Market Data
+3. Trading Strategy
+4. AI & Machine Learning
+5. Signal Engine
+6. Backtesting & Performance
+7. Risk Management
+8. Technical Details
+9. Known Limitations
+10. Final Assessment
+
+---
+
+## 1. Project Overview
+
+### ১.১ Bot কীভাবে কাজ করে? (সম্পূর্ণ data flow)
+
+```
+market-qx.info (Quotex white-label)
+        │  wss://ws2.market-qx.info/socket.io/  (Engine.IO v3, login ছাড়াই public)
+        ▼
+MarketQX._recv_loop → _store()          market_qx_candles.py:173,210
+        │  tick frame: [asset, ts, price, dir]
+        ▼
+CandleBuilder.add()                     market_qx_candles.py:57
+        │  tick → 8 timeframe OHLC candle (শুধু closed candle ব্যবহার হয়)
+        ▼
+MultiFeed._on_tick()                    candle_store.py:213
+        ├──→ CandleStore.save()         candle_store.py:62   → data/candles.db
+        └──→ CandleStore.save_ticks()   candle_store.py:76   → ticks টেবিল
+        ▼
+Engine.evaluate(candles)  ── ৩টি ইঞ্জিন ──
+   rule     : signal_bot.SignalEngine.evaluate()    signal_bot.py:87
+   smart    : smart_engine.SmartEngine.evaluate()   smart_engine.py:106
+   ensemble : ensemble.EnsembleEngine.evaluate()    ensemble.py:123
+        ▼
+analysis.analyze*() → Analysis dataclass   analysis.py
+        ▼
+dashboard.Hub → /api/scan, /api/analyze   dashboard.py:417,536
+   + Hub._journal_loop() → Journal → settle   dashboard.py:451
+   + golive.gate() → DEMO / NOT READY / LIVE-READY   golive.py:100
+```
+
+**গুরুত্বপূর্ণ:** বট শুধু **সিগন্যাল (alert)** দেয় — কোথাও **কোনো trade place করে না**।
+`grep` করে নিশ্চিত করা হয়েছে: কোনো `place_trade` / `buy` / `sell` / order-execution কোড নেই।
+সব ফাইলের docstring-এ লেখা: *"Signals are alerts only — never a trade instruction."*
+
+### ১.২ Programming Language ও Framework
+
+| বিষয় | বাস্তবতা |
+|---|---|
+| ভাষা | Python 3 (venv: 3.13; Docker: `python:3.12-slim`) |
+| Framework | **কোনো web framework নেই** — stdlib `http.server.ThreadingHTTPServer` (`dashboard.py:521,637`) |
+| WebSocket | `websocket-client` (third-party) |
+| ML | `scikit-learn`, `numpy` |
+| Storage | stdlib `sqlite3` (WAL mode) |
+| মোট dependency | মাত্র ৩টি — `requirements.txt`: `websocket-client`, `numpy`, `scikit-learn` |
+
+### ১.৩ System Architecture
+
+- **একটি** WebSocket connection → **৯১টি পেয়ার × ৮টি timeframe** = ৭২৮টি candle builder (`candle_store.py:168`)
+- SQLite-এ ২টি DB:
+  - `data/candles.db` (candle + ticks)
+  - `data/journal.db` (signal track record)
+  - আলাদা রাখা হয়েছে যাতে একটার ক্ষতি অন্যটাকে না ছোঁয়
+- HTTP API ৬টি endpoint: `/api/scan`, `/api/analyze`, `/api/state`, `/api/catalog`, `/api/journal`, `/api/golive`
+- Docker → Render deployment (`render.yaml`, persistent disk `/data`)
+
+---
+
+## 2. Market Data
+
+### ২.১ Live data কোথা থেকে আসে?
+
+**Quotex-এর নিজের feed থেকে** — external API নয়। `market_qx_candles.py:104-105`:
+
+```python
+HOST = "ws2.market-qx.info"
+ORIGIN = "https://market-qx.info"
+```
+
+এটা Quotex/QxBroker-এর **white-label**। market-qx.info ওয়েবসাইট Cloudflare + geo-blocked,
+কিন্তু তার trading terminal একটা **plain Socket.IO (Engine.IO v3)** feed চালায় যা
+**login ছাড়াই** public market data দেয় (`market_qx_candles.py:1-22` ডকুমেন্টেড)।
+
+Protocol (`_store`, `market_qx_candles.py:210`):
+
+- `42["instruments/list", ...]` → সব asset list
+- `42["instruments/follow","<ASSET>"]` → live tick: `[[asset, epoch_sec, price, dir]]`
+- `451-["history/list/v2", ...]` → server OHLC (**SSID লাগে**)
+
+### ২.২ Historical OHLC কীভাবে সংগ্রহ হয়?
+
+**ফিডে public history নেই** (`candle_store.py:1-10`)। তাই bot **নিজেই** tick থেকে candle বানায়
+এবং **নিজের SQLite-এ জমায়**:
+
+- `CandleBuilder.add()` (`market_qx_candles.py:57`) — tick কে bucket-এ ফেলে OHLC বানায়
+- `CandleStore.save()` (`candle_store.py:62`) — `INSERT OR IGNORE` (WAL mode)
+- Server history (`load_history`, line 245) শুধু **SSID দিলে** চলে — এখন সেটা ব্যবহৃত হয় না
+
+**আসল সংগৃহীত ডেটা (অডিটের সময়):**
+
+| period | candles |
+|---|---|
+| 5s | 303,201 |
+| 15s | 81,081 |
+| 30s | 40,859 |
+| 60s | 20,202 |
+| 120s | 9,919 |
+| 300s | 4,004 |
+| 600s | 1,820 |
+| 900s | 1,365 |
+| **মোট** | **462,451 candles / 91 pairs** |
+| **Ticks** | **567,322 / 91 pairs** |
+
+### ২.৩ Data কত ঘন ঘন update হয়?
+
+লাইভ মাপা: **~১৭২–১৭৮ tick/সেকেন্ড** (৯২ পেয়ারে)।
+`dashboard.py:_tps_loop` → `GET /api/state` → `"tps"`।
+৫s timeframe = প্রতি ৫ সেকেন্ডে নতুন candle।
+
+### ২.৪ Missing / inaccurate data কীভাবে handle হয়?
+
+| সমস্যা | সমাধান | Location |
+|---|---|---|
+| Discovery খালি আসে | ৩ বার retry, তারপর stored pairs-এ fallback | `candle_store.py:143-160` |
+| Connection drop | `_recv_loop` reconnect + `connected` flag | `market_qx_candles.py:173-182` |
+| Candle duplicate | `INSERT OR IGNORE` (PRIMARY KEY) | `candle_store.py:62` |
+| Dead pair (মার্কেট বন্ধ) | `_is_dead()` — শেষ ২০ candle flat হলে বাদ | `scan.py:72` |
+| Flat candle | Journal-এ `flat` (tie) হিসেবে settle, loss নয় | `journal.py:120` |
+| Tick flush | ৫s batch-এ flush (SQLite feed block করে না) | `candle_store.py:206` |
+
+**⚠️ কিন্তু কোনো data-quality validation নেই** — price spike detection, gap detection,
+বা outlier rejection নেই।
+
+---
+
+## 3. Trading Strategy
+
+### ৩.১ Indicators (সব pure-Python, `indicators.py`)
+
+| Indicator | Function | Line |
+|---|---|---|
+| SMA | `sma()` | 9 |
+| EMA | `ema()` | 24 |
+| RSI (Wilder) | `rsi()` | 44 |
+| MACD | `macd()` | 69 |
+| Bollinger Bands | `bollinger()` | 92 |
+| ATR | `atr()` | 115 |
+| Stochastic | `stochastic()` | 134 |
+| **ADX (+DI/−DI)** | `adx()` | 165 |
+| Cross detection | `crossed_above/below()` | 213, 222 |
+
+### ৩.২ SMC / ICT উপাদান — আছে (`smc.py`)
+
+| Concept | Implemented? | Function | Line |
+|---|---|---|---|
+| Swing pivots (fractal) | ✅ | `swings()` | 24 |
+| Market structure (HH+HL / LH+LL) | ✅ | `structure()` | 46 |
+| **Liquidity Sweep** | ✅ | `liquidity_sweep()` | 66 |
+| **Order Block** | ✅ | `order_block()` | 91 |
+| **FVG (Fair Value Gap)** | ✅ | `fair_value_gap()` | 116 |
+| Premium/Discount zone | ✅ | `dealing_range()` | 129 |
+| **BOS** | ⚠️ আংশিক — `structure()` HH+HL/LH+LL হিসাব করে, কিন্তু আলাদা BOS detector **নেই** | — | — |
+| **CHoCH** | ❌ **নেই** — কোনো change-of-character detector নেই | — | — |
+
+**সৎ নোট:** `smc.py:11` docstring-এ "BOS" লেখা, কিন্তু সেটা শুধু `structure()`।
+**ICT-এর MSP / CHoCH / breaker block কিছুই নেই।** "ICT" শব্দ কোডে নেই।
+
+### ৩.৩ Market structure শনাক্তকরণ (`smc.py:46`)
+
+`swings()` দিয়ে fractal pivot বের করে শেষ ২টি swing high/low তুলনা করে:
+
+- HH+HL → `"up"`
+- LH+LL → `"down"`
+- নাহলে → `"range"`
+
+Lookback ৬০ candle।
+
+### ৩.৪ BUY/SELL signal logic — ৩টি ইঞ্জিন
+
+**১. Rule engine** (`signal_bot.py:87`) — weighted vote:
+
+```
+trend:      EMA fast>slow → bull+2 ; price>EMA50 → bull+1
+momentum:   EMA cross → +2 ; MACD cross → +2 ; MACD>signal → +1
+oscillator: RSI<30 → bull+1 ; RSI>70 → bear+1 ; Stoch cross → +1
+volatility: close<lower BB → bull+1 ; close>upper BB → bear+1
+
+net = bull - bear ;  |net| >= threshold(4) হলে fire
+```
+
+Debounce: একই দিক পরপর fire করে না (`signal_bot.py:184`)।
+
+**২. Smart engine** (`smart_engine.py:106`) — regime-aware:
+
+- **ADX gate:** ADX<20 → range (শুধু mean-reversion), ADX>25 → trend (শুধু momentum), মাঝে → skip
+- **ATR gate:** ATR must be 0.5×–3.0× recent median
+- **Breakout confirmation:** trend-এ price must clear recent extreme
+- **HTF confirmation:** EMA(50) trend দিকের সাথে মিলতে হবে
+- Confidence 0..1 (raw vote নয়)
+
+**৩. Ensemble** (`ensemble.py:123`) — ৩টি "model" ভোট:
+
+- `trend` + `smc` + `momentum`
+- `min_agree=2`
+- **hard trend gate** (`require_trend=True`, line 172 — trend-এর বিপরীতে trade বাতিল)
+- `--patterns` দিলে `patterns.pattern_vote()` (`patterns.py:189`) ৪র্থ ভোট
+
+### ৩.৫ Entry timing ও Expiry (`scan.py:49`, `entry_plan()`)
+
+```
+nxt      = last_closed_candle_time + period   # পরের boundary
+boundary = next future boundary
+entry    = max(nxt, boundary)                 # look-ahead নেই
+expiry   = entry + period * expiry_candles    # ডিফল্ট ১ candle
+```
+
+সব ইঞ্জিন **শুধু closed candle** দেখে — live ও backtest একই কোড, look-ahead নেই।
+
+---
+
+## 4. AI & Machine Learning
+
+### ৪.১ কোন model ব্যবহার হয়েছে? — ৩টি sklearn family (`ai_ensemble.py:106-110`)
+
+| Model | Class | Parameter |
+|---|---|---|
+| `gbm` | `GradientBoostingClassifier` | default |
+| `rf` | `RandomForestClassifier` | `n_estimators=200, max_depth=6, min_samples_leaf=50` |
+| `logit` | `LogisticRegression` | `max_iter=2000, C=0.5` + `StandardScaler` |
+
+`train_model.py:118`-ও `GradientBoostingClassifier(n_estimators=200, max_depth=3, learning_rate=0.05)` ব্যবহার করে।
+
+**কোনো deep learning নেই** — `torch` install করা নেই (যাচাই: `ModuleNotFoundError`)।
+কোনো LSTM / CNN / Transformer নেই।
+
+### ৪.২ সত্যিই train করা হয়, নাকি rule-based?
+
+**দুটোই আছে, আলাদা করে:**
+
+- `signal_bot` / `smart_engine` / `ensemble` = **সম্পূর্ণ rule-based** (কোনো ML নেই)
+- `train_model.py` / `ai_ensemble.py` / `ai_bot.py` = **সত্যিকারের ML** (sklearn `.fit()`)
+
+### ৪.৩ Training dataset কত বড়? (বাস্তব)
+
+`ai_ensemble.py --period 15` চালিয়ে:
+
+- **Train: 29,022 rows**
+- **Test: 21,346 rows**
+- ৬২টি OTC পেয়ার
+- 60/40 strict **time split** (`build_dataset`, `ai_ensemble.py:57` — `cut_frac=0.6`, কখনো shuffle নয়)
+
+### ৪.৪ Features — ২৬টি (`features.py:13-37`, `FEATURES` list)
+
+```
+ret_1/3/5/10, body, upper_wick, lower_wick,
+ema_fast_slow, ema_slow_trend, price_ema_fast, price_ema_trend,
+ema_slope_fast, ema_slope_slow, rsi, rsi_slope,
+macd_hist, macd_hist_prev, bb_pos, bb_width, atr_pct,
+stoch_k, stoch_kd, consec_up, consec_down, hour_sin, hour_cos
+```
+
+`compute_features()` (`features.py:34`) — সব শুধু `candles[0..i]` থেকে, **look-ahead নেই**।
+
+### ৪.৫ Prediction probability কীভাবে?
+
+`model.predict_proba(X)[:, 1]` → `prob_up` (`ai_bot.py:44`)।
+`action = UP if prob_up >= 0.5`।
+Ensemble-এ ৩ model-এর vote: `up >= 2` হলে CALL (`ai_ensemble.py:120`)।
+
+### ৪.৬ Retrain কীভাবে হয়?
+
+**স্বয়ংক্রিয় retrain নেই।** ম্যানুয়াল script চালাতে হয় (`train_model.py`, `ai_ensemble.py`)।
+Live-এ কোনো online learning / model update নেই।
+
+### ৪.৭ 🔴 বাস্তব ML ফলাফল (আসল পরীক্ষা, `ai_ensemble.py --period 15`)
+
+```
+=== 3 AI models, 15s, otc, 62 pairs, payout 85% (breakeven 54.1%) ===
+  test rows: 21,346  (train 29,022, strict time split)
+
+  single models:
+    gbm    n=21346  hit= 50.1%  CI[49.4,50.8]  p=0.753
+    rf     n=21346  hit= 50.1%  CI[49.4,50.8]  p=0.805
+    logit  n=21346  hit= 50.4%  CI[49.7,51.0]  p=0.292
+  combined rules:
+    agree_2of3            n=21346  hit=50.1%  CI[49.5,50.8]  p=0.702
+    agree_2of3_trendgate  n=10102  hit=50.5%  CI[49.5,51.5]  p=0.330
+    agree_3of3            n= 8178  hit=50.6%  CI[49.5,51.6]  p=0.320
+```
+
+**তিনটি model, ২-এর-বেশি ভোট, trend gate — সবই ~৫০%।** কোনো edge নেই (breakeven ৫৪.১%)।
+
+**সৎ প্রমাণ যে pipeline আসলে শেখে:**
+
+- synthetic momentum data: `acc ~73%, AUC ~0.82`
+- random-walk synthetic: `~50%, AUC ~0.51`
+- (`AGENTS.md:145-147`)
+
+অর্থাৎ code কাজ করে — কিন্তু **এই ফিডে শেখার মতো pattern নেই**।
+
+---
+
+## 5. Signal Engine
+
+### ৫.১ Signal score কীভাবে?
+
+- **Rule:** `score = |bull − bear|` (weighted vote) — `signal_bot.py:175`
+- **Smart:** `confidence` (0..1) → `score = round(confidence*10)` — `analysis.py:62`
+- **Ensemble:** `score = কতটি model একমত` (`EnsembleSignal.score`, `ensemble.py:59`)
+- **AI:** `score` নেই; `prob_up` আছে
+
+### ৫.২ BUY / SELL / NO TRADE condition
+
+| Engine | CALL/PUT | NO TRADE |
+|---|---|---|
+| Rule | `\|net\| >= 4` এবং direction বদলেছে | score কম, বা same direction repeat |
+| Smart | regime+vol+breakout+HTF সব pass | যেকোনো gate fail, বা `conf < 0.5` |
+| Ensemble | `>= 2/3` model একমত **এবং** trend gate pass | কম agreement, বা trend-এর বিপরীত |
+| AI | `prob_up >= 0.5` এবং `conf >= min_confidence` | `conf < 0.55` |
+
+### ৫.৩ একাধিক strategy combine কীভাবে?
+
+`scan_all()` (`scan.py:92`) সব (pair, timeframe) জুড়ে চালায় →
+`signals.sort(key=lambda rt: (-abs(score), ...))` (`scan.py:118`) — সবচেয়ে শক্তিশালী signal আগে।
+Dashboard / Telegram / CLI **একই** `scan_all()` ব্যবহার করে, তাই সব surface মেলে।
+
+### ৫.৪ False signals কীভাবে filter করে?
+
+1. **Debounce** — একই দিক পরপর fire করে না (`signal_bot.py:184`, `ensemble.py:131`)
+2. **Cooldown** — `cooldown_candles=5` (`smart_engine.py:64`)
+3. **Dead-pair skip** — `_is_dead()` (`scan.py:72`)
+4. **Regime / volatility gate** (smart engine)
+
+**🔴 কিন্তু বাস্তব পরীক্ষা:** `selective.py` সব knob (threshold 2→8, trend agreement,
+ATR vol gate, MTF confluence) sweep করে — **কিছুই wrong-signal rate কমায় না**।
+hit-rate ~৫০–৫৩% থাকে, CI সবসময় ৫৪.১% breakeven-কে straddle করে।
+MTF যোগ করলে **আরও খারাপ** (52.9% → 52.2%), vol gate-এ 51.2%।
+
+---
+
+## 6. Backtesting & Performance
+
+### ৬.১ Backtesting system আছে কি? — হ্যাঁ, ৬টি আলাদা honest harness
+
+| Tool | কাজ | Look-ahead? |
+|---|---|---|
+| `backtest.py` | Walk-forward, next-candle direction, Wilson CI + p-value, random control | নেই |
+| `edge.py` | প্রতি (pair, timeframe) hit-rate vs payout breakeven | নেই |
+| `research.py` | Precomputed features, শত শত hypothesis, train/val/test split + Bonferroni | নেই |
+| `randomwalk.py` | Autocorrelation, variance ratio, direction predictability | নেই |
+| `selective.py` | Selectivity knob sweep, held-out 40% | নেই |
+| `invert.py` | Anti-signal hypothesis, train-এ policy, test-এ apply | নেই |
+
+### ৬.২ কতগুলো trade পরীক্ষা করা হয়েছে? (বাস্তব)
+
+| পরীক্ষা | n |
+|---|---|
+| `edge.py` (৬২ pairs) | প্রতিটি pair 20+ signals |
+| `ai_ensemble.py` 15s | 21,346 test rows |
+| `randomwalk.py` | 462,451 candles |
+| Journal (forward) | 42 settled |
+| Tick analysis | 567,322 ticks |
+
+### ৬.৩ Win rate / loss rate / profit factor / expectancy
+
+**কোনো profit factor বানানো হয়নি — কারণ কোডে সেটা হিসাব করা নেই।**
+
+`backtest.py --compare --control` (documented, `AGENTS.md:590`):
+
+```
+rule   52.2%  (p=0.19)
+smart  53.2%  (p=0.07)
+random 49.2%   ← control
+```
+
+`backtest.py` **expectancy ATR units-এ** দেয় (`spread_atr=0.15` cost proxy, `backtest.py:131`),
+কিন্তু profit factor হিসাব করে না।
+
+**Forward (journal) — আসল track record:**
+
+```
+logged 77 | settled 42 | open 35
+win 11 | loss 15 | flat 16
+decisive hit-rate 42.3%  CI[25.5, 61.1]  p=0.557
+```
+
+**Render live gate (৩৮৬ settled):**
+
+```
+hit_rate 44.19%  CI[39.1, 49.4]  p=0.029
+paper: 1000 → 517  (−48.3%)   max DD 50.4%
+```
+
+### ৬.৪ Out-of-sample testing — ✅ হ্যাঁ
+
+`ai_ensemble.py:57` `cut_frac=0.6` — প্রথম ৬০% train, শেষ ৪০% test, **per pair time split**।
+`research.py` train/val/test ৩-ভাগ।
+
+### ৬.৫ Walk-forward validation — ✅ হ্যাঁ
+
+`train_model.py:74` `walk_forward()` — expanding window, ৫টি fold, `min_train=0.4`,
+প্রতি fold-এ accuracy + AUC + baseline।
+
+### ৬.৬ Demo forward testing — ✅ হ্যাঁ (এটাই সবচেয়ে শক্তিশালী)
+
+`journal.py` লাইভ signal জমিয়ে expiry candle close-এ settle করে।
+Dashboard-এ background-এ চলে (`dashboard.py:451 _journal_loop`)।
+**এটাই আসল forward test** — backtest অতীত দেখে, journal এখন থেকে মাপে।
+
+### ৬.৭ Payout ও transaction cost — ⚠️ আংশিক
+
+- **Payout:** সব জায়গায় **hardcoded `0.85`** (৫ জায়গায়) — feed payout পাঠায় না
+- **Cost:** `backtest.py:131` `spread_atr=0.15` (rough proxy)
+- **❌ কিন্তু আসল Quotex payout কখনো ব্যবহার করা হয়নি** — Quotex payout ৭০–৯৫% পর্যন্ত হয়।
+  ৯৫% payout-এ breakeven মাত্র **৫১.৩%**, যেখানে ensemble 15s-এ ৫১.৬% পেয়েছে (একমাত্র honest unknown)
+
+---
+
+## 7. Risk Management
+
+| প্রশ্ন | উত্তর | প্রমাণ |
+|---|---|---|
+| Consecutive losses handle? | **❌ না** — কোনো loss-streak rule নেই। Journal-এ শুধু `worst_losing_streak` *মাপা* হয় | `golive.py:71` |
+| News filter? | **❌ নেই** — কোনো economic-calendar integration নেই। শুধু ATR spike gate (ATR > 3× median skip) | `smart_engine.py:60` |
+| High-volatility filter? | ✅ **আছে** — ATR 0.5×–3.0× recent median | `smart_engine.py:160-168` |
+| **Martingale?** | **❌ নেই** — কোনো stake-doubling নেই। Paper account fixed-fraction (১% per trade) | `golive.py:55` |
+| কখন NO TRADE? | ADX transitional (20–25), ATR range-এর বাইরে, breakout fail, HTF disagree, agreement <2/3, `conf<0.5` | `smart_engine.py`, `ensemble.py` |
+| Position sizing? | Paper-only 1% fixed fraction | `golive.py:55` |
+| Daily loss limit? | **❌ নেই** | — |
+
+**🔴 গুরুত্বপূর্ণ:** বট **কোনো টাকা জড়িত না** — কোনো live trading নেই।
+"Risk management" এখানে শুধু signal quality filter, কারণ **কোনো trade হয়ই না**।
+
+---
+
+## 8. Technical Details
+
+### ৮.১ সব Python module ও কাজ
+
+| Module | কাজ | Lines |
+|---|---|---|
+| `market_qx_candles.py` | WebSocket feed + tick→OHLC builder | 306 |
+| `candle_store.py` | SQLite candle+tick store, MultiFeed | 286 |
+| `collect_data.py` | CSV-এ candle জমায় | 77 |
+| `collect_ticks.py` | Tick collector (৯১ pair, reconnect) | 100 |
+| `indicators.py` | ৮টি indicator (pure Python) | 227 |
+| `signal_bot.py` | Rule engine (weighted vote) | 247 |
+| `smart_engine.py` | Regime-aware engine | 250 |
+| `ensemble.py` | 3-model confluence (SMC+trend+momentum) | 252 |
+| `smc.py` | SMC primitives (sweep/OB/FVG/structure) | 178 |
+| `patterns.py` | Chart patterns (H&S, double, triangle, flag, S/R) | 214 |
+| `analysis.py` | Engine→Analysis adapter | 190 |
+| `features.py` | ২৬টি ML feature | 110 |
+| `train_model.py` | Walk-forward ML training | 153 |
+| `ai_bot.py` | Live AI prediction | 123 |
+| `ai_ensemble.py` | 3 ML model + vote | 191 |
+| `backtest.py` | Walk-forward backtest | 224 |
+| `edge.py` | Per-pair edge finder | 154 |
+| `research.py` | Fast hypothesis harness | 556 |
+| `randomwalk.py` | Random-walk diagnostics | 133 |
+| `selective.py` | Selectivity sweep | 207 |
+| `invert.py` | Anti-signal test | 183 |
+| `tickflow.py` | Tick order-flow features | 171 |
+| `scan.py` | All-pair scanner | 234 |
+| `journal.py` | Forward track record | 291 |
+| `golive.py` | Demo→real gate + paper account | 235 |
+| `alerts.py` | Telegram alerts | 290 |
+| `dashboard.py` | Web UI + API (stdlib http.server) | 644 |
+| `verify_feed.py` | Feed liveness proof | 52 |
+| `make_synthetic.py` | Test data generator | 65 |
+| ১৩টি test file | ৪৭টি test function | — |
+
+### ৮.২ API ও external libraries
+
+- **HTTP:** stdlib `http.server` (কোনো Flask/FastAPI নেই)
+- **WebSocket:** `websocket-client`
+- **ML:** `scikit-learn`, `numpy`
+- **Telegram:** stdlib `urllib` (`alerts.py`) — কোনো SDK নেই
+- **External API:** শুধু `ws2.market-qx.info` (feed) + optional Telegram Bot API
+
+### ৮.৩ Android-এ কীভাবে run করে?
+
+**❌ Android support নেই।** `grep` করে কোনো `kivy` / `buildozer` / `termux` পাওয়া যায়নি।
+এটি একটি **server-side Python service**।
+Android-এ চালাতে হলে Termux-এ Python+venv বসিয়ে চালানো যাবে (তবে সহজ নয়)।
+
+### ৮.৪ VPS / external server লাগে কি?
+
+- **লোকাল চলার জন্য:** না (`./run_dashboard.sh`)
+- **স্থায়ী public link-এর জন্য:** **হ্যাঁ** — Render (এখন ব্যবহৃত), Fly.io, বা নিজের VPS (~$5/মাস)।
+  `DEPLOY.md`-এ তিন অপশন ডকুমেন্টেড।
+- **⚠️ Render free tier ঘুমিয়ে পড়ে → WebSocket drop হয়।** `render.yaml`-এ `plan: starter` দেওয়া।
+
+### ৮.৫ Simulated / placeholder functionality আছে কি?
+
+| জিনিস | বাস্তব নাকি placeholder |
+|---|---|
+| Candle / tick data | ✅ আসল live feed |
+| Signals | ✅ আসল calculation |
+| ML models | ✅ সত্যিকারের sklearn model |
+| Paper account | ⚠️ Simulated — `golive.py:39 paper_curve()`, ইচ্ছাকৃত |
+| `make_synthetic.py` | ⚠️ Synthetic generator — শুধু pipeline test-এর জন্য |
+| `_placeholder` | ✅ শুধু feed-এর handshake marker ignore করতে |
+| `_on_closed` hook | ✅ খালি (`dashboard.py:471`) — future alerts-এর জন্য |
+| Trade execution | ❌ নেই (ইচ্ছাকৃত — alerts only) |
+
+**কোনো fake / hardcoded signal data নেই।** তবে **payout hardcoded 0.85** — এটা আসল নয়, অনুমান।
+
+---
+
+## 9. Known Limitations
+
+### ৯.১ বটের বর্তমান দুর্বলতা
+
+1. **🔴 কোনো measurable edge নেই** — ৪৬২k candle, ৫৬৭k tick, ২১k ML test row, ৪২ forward trade — **সব ~৫০%**। Breakeven ৫৪.১% (৮৫% payout)।
+2. **Forward track record নেতিবাচক** — journal ৪২.৩% decisive; Render-এ ৩৮৬ settled-এ **৪৪.১৯%**; paper account ১০০০→৫১৭ (**−৪৮.৩%**)।
+3. **OTC pairs synthetic** — `_otc` পেয়ার (বেশিরভাগ ডেটা) broker নিজে বানায়, স্বভাবতই unpredictable (`verify_feed.py:1-12`)।
+4. **Real (non-OTC) pairs মার্কেট বন্ধে জমে থাকে** — flat rate 1.00, তাই weekend-এ real-pair test অর্থহীন।
+5. **Payout অজানা** — feed payout দেয় না, hardcoded 0.85। এটাই সবচেয়ে বড় blind spot।
+6. **Overfitting ঝুঁকি** — `research.py` নিজেই multiple-testing নিয়ে সতর্ক করে; sweep-এ ভালো দেখানো hypothesis test-এ ভেঙে পড়ে (`rsi_extreme_20_80`: val 55.1% → test 48.0%)।
+
+### ৯.২ অসম্পূর্ণ features
+
+| Feature | অবস্থা |
+|---|---|
+| SSID-authenticated path | কোড আছে (`load_history`, `authorization`), কিন্তু কখনো ব্যবহার হয়নি |
+| Server-side OHLC history | `_store()` পার্স করে, কিন্তু SSID ছাড়া চলে না |
+| Real payout | ❌ নেই |
+| News calendar filter | ❌ নেই |
+| Auto-retrain | ❌ নেই |
+| Trade execution | ❌ নেই (ইচ্ছাকৃত) |
+| CHoCH / ICT MSP | ❌ নেই |
+| Daily loss limit / loss-streak rule | ❌ নেই |
+| Data validation (spike/gap) | ❌ নেই |
+| Tick order-flow edge | ডেটা জমছে (৫৬৭k), কিন্তু `tickflow.py` এখনো যথেষ্ট নয় |
+
+### ৯.৩ কোথায় ভুল signal আসতে পারে?
+
+1. **Debounce direction state** — `_last_action` engine instance-এ থাকে; একই engine বারবার ব্যবহারে state carry করে
+2. **`_journal_loop` দুটো engine (rule+ensemble) একসাথে জমায়** (`dashboard.py:459`), কিন্তু `golive.gate()` **সব মিশিয়ে** হিসাব করে — engine-ভিত্তিক বিচ্ছিন্ন verdict নেই
+3. **Flat settle** — `sp == ep` হলে `flat` (tie); ৩৮% flat (market-closed pair-এর কারণে) — statistics দুর্বল করে
+4. **Candle close vs open** — backtest `close[i+1] − open[i+1]`, journal `close[i+1] − close[i]` — **সামান্য ভিন্ন definition** (`backtest.py:126` vs `journal.py:120`)
+5. **Feed stall** — reconnect হলে কিছু tick হারাতে পারে (কোনো gap-fill নেই)
+
+### ৯.৪ বাস্তব মার্কেটে ব্যবহারের আগে যা পরীক্ষা প্রয়োজন
+
+1. **অন্তত ৩০০+ settled decisive signal** (gate-এর শর্ত) — এখন ৪২
+2. **আসল payout** জানা (SSID দিয়ে) — ৯০%+ payout-এর pair খোঁজা
+3. **Real (non-OTC) pair** মার্কেট খোলা অবস্থায় টেস্ট
+4. **Walk-forward edge > 0** প্রমাণ (এখন ~0)
+5. **Drawdown <= 25%** (Render-এ −৫০.৪%, ব্যর্থ)
+6. **Multiple-testing correction** — `research.py` ইতিমধ্যে করে
+
+---
+
+## 10. Final Assessment
+
+### ১০.১ বটটি Rule-based, AI-assisted, নাকি genuine ML-based?
+
+**সৎ উত্তর: Rule-based, সাথে একটি genuine (কিন্তু ineffective) ML subsystem।**
+
+| Component | ধরন |
+|---|---|
+| `signal_bot`, `smart_engine`, `ensemble`, `smc`, `patterns` | **১০০% rule-based** (হাতে লেখা শর্ত) |
+| `ai_bot`, `ai_ensemble`, `train_model` | **Genuine ML** — sklearn `.fit()`, সত্যিকারের training |
+| Dashboard, scan, journal, golive | Rule-based infrastructure |
+
+ML **সত্যিকারের** (mock নয়) — প্রমাণ: synthetic momentum-এ ৭৩% শেখে, random-walk-এ ৫০%।
+কিন্তু **এই ফিডে ML কোনো edge পায় না**। তাই বাস্তবে এটি একটি
+**rule-based signal generator + honest ML research harness**।
+
+### ১০.২ বর্তমানে কতটা কার্যকর প্রমাণ পাওয়া গেছে?
+
+**সিগন্যাল দেওয়ার ক্ষেত্রে:** ✅ কাজ করে — লাইভ, ৯২ pair, ১৭২ tick/s, ৪৬২k candle, ৫৬৭k tick।
+
+**লাভজনক হওয়ার ক্ষেত্রে:** ❌ **শূন্য প্রমাণ।** উল্টো — **নেতিবাচক প্রমাণ**:
+
+- 21,346 ML test rows → ~50%
+- Forward journal → 42.3%
+- Render live gate → 44.19%, paper −48.3%
+- সব backtest → 47–53%, কোনো CI breakeven ছাড়ায় না
+
+**🎯 কিন্তু একটি জিনিস অসাধারণভাবে কাজ করেছে:**
+**`golive.py` gate 🔴 NOT READY দেখাচ্ছে** — অর্থাৎ সিস্টেম **নিজেই বলছে "টাকা লাগাবেন না"**।
+এটাই সবচেয়ে দামি অংশ, কারণ এটা আপনাকে লস থেকে বাঁচাচ্ছে।
+একটি অসৎ bot "৯০% win rate!" বলে আপনাকে টাকা হারাতো।
+
+### ১০.৩ কোন ১০টি উন্নতি নির্ভরযোগ্যতা বাড়াবে
+
+1. **SSID সংযুক্ত করুন** — আসল payout + server OHLC history আনলক হবে; ৯০–৯৫% payout-এর pair খুঁজে breakeven ৫১.৩% নামানো সম্ভব
+2. **Real payout feed** — hardcoded 0.85 সরিয়ে আসল payout প্রতি pair-এ
+3. **দীর্ঘ timeframe ডেটা** — দিন/সপ্তাহ 5m+; `research.py` আবার চালানো (এখন মাত্র কয়েক ঘণ্টা)
+4. **Real (non-OTC) pair মার্কেট খোলা অবস্থায় টেস্ট** — genuine FX microstructure আছে (দুর্বল হলেও)
+5. **Tick order-flow সম্পূর্ণ পরীক্ষা** — `tickflow.py` এখনো ডেটা-ক্ষুধার্ত; কয়েক দিনের tick দরকার
+6. **Walk-forward model retraining** — সময়ের সাথে model refresh (এখন static)
+7. **Journal-কে engine-ভিত্তিক আলাদা করুন** — rule আর ensemble-এর verdict মিশবেন না
+8. **Candle close/open definition একীভূত করুন** — backtest ও journal একই rule ব্যবহার করবে
+9. **Data validation layer** — price spike/gap detection, feed-stall gap-fill
+10. **Loss-streak ও daily-loss rule** — যদি কখনো live ট্রেডিং যোগ হয় (এখন নেই)
+
+### ১০.৪ 🔴 চূড়ান্ত সতর্কবার্তা
+
+এই bot একটি **উন্নত, সৎ, ভালো-ইঞ্জিনিয়ারড সিগন্যাল সিস্টেম** — ৪২টি ফাইল, ৪৭টি টেস্ট,
+৬টি backtest harness, লাইভ ৯২-pair feed, persistent SQLite, Render deployment।
+কিন্তু **এটি টাকা বানানোর প্রমাণ দেয়নি — বরং প্রমাণ দেয় যে এই ফিডে candle/indicator/ML দিয়ে edge নেই।**
+
+**আসল trade-এ ব্যবহার করবেন না** যতক্ষণ `golive.py` gate 🟢 **LIVE-READY** না বলে।
+এখন এটা 🔴 **NOT READY** — এবং এটাই বটের সবচেয়ে সৎ ও মূল্যবান বৈশিষ্ট্য।
+
+> **এক লাইনে:** Random walk in, coin flip out — এবং bot সেটা লুকায় না, সেটাই বলছে। 🤖
+
+---
+
+**অডিট সম্পন্ন।** কোনো কোড পরিবর্তন করা হয়নি — শুধু পড়া, চালানো, ও মাপা।
+প্রতিটি সংখ্যা বাস্তব `data/candles.db` (462,451 candle, 567,322 tick),
+`data/journal.db` (৪২ settled), এবং চালানো script-এর output থেকে।
