@@ -53,6 +53,17 @@ git remote add origin https://github.com/<আপনার-নাম>/<repo>.git
 git push -u origin master
 ```
 
+> **টোকেন লাগবে:** এই sandbox-এর `GITHUB_TOKEN` শুধু **পড়তে** পারে (push করলে
+> 403 আসে)। তাই একটা fine-grained Personal Access Token বানান —
+> https://github.com/settings/personal-access-tokens/new
+> Repository access: আপনার repo · Permissions: **Contents = Read and write**।
+> তারপর:
+> ```bash
+> ./push_github.sh <আপনার-টোকেন>
+> ```
+> স্ক্রিপ্টটা টোকেন দিয়ে একবার পুশ করে, তারপর `.git/config` থেকে মুছে দেয়।
+> ব্রাঞ্চ আগেই কমিট করা আছে (`feat/live-candle-dashboard`), তাই শুধু পুশ হলেই হবে।
+
 ### ধাপ ২ — Fly.io-তে deploy
 
 ```bash
