@@ -105,6 +105,15 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `validation.py` | purged walk-forward + embargo + payout-adjusted metrics; coin-flip control |
 | `power.py` | sample-size / statistical-power calculator (how much data before an edge is believable) |
 | `audit_leakage.py` | look-ahead & leakage audit (future-permutation, causality, fold disjointness, control) |
+| `structure.py` | market structure: swings, HH/HL/LH/LL, BOS, CHoCH, MSS, internal/external |
+| `liquidity.py` | liquidity pools (equal highs/lows), sweeps + reclaim, displacement, session levels |
+| `zones.py` | order blocks & FVGs **with measured validity** (respect vs violation rate) |
+| `regime.py` | regime: trend strength, volatility bucket, variance ratio, Hurst, session |
+| `microstructure.py` | tick velocity / acceleration / bursts / imbalance / autocorrelation |
+| `decision.py` | measured-reliability ensemble + expected-value NO TRADE gate |
+| `intelligence.py` | one-candle market-structure / liquidity / SMC read -> engine votes |
+| `features_v2.py` | base features + structure/liquidity/regime/zone features (causal) |
+| `ml_validate.py` | purged walk-forward + permutation importance + random-walk control on v2 features |
 | `invert.py` | is the signal anti-predictive? policy chosen on train, frozen, applied to test |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
@@ -134,6 +143,14 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_power.py` | sample-size math (inverse-normal, monotonicity, order of magnitude) |
 | `test_validation.py` | stats, folds+embargo, metrics verdicts, random-walk negative control, injected-edge positive control |
 | `test_leakage.py` | each audit check passes clean and FAILS on a deliberately leaky detector |
+| `test_structure.py` | swings, trend, BOS/CHoCH/MSS, internal-external, causality |
+| `test_liquidity.py` | equal levels, pools, displacement, sweep+reclaim, session levels |
+| `test_zones.py` | OB/FVG detection, exclusive lifecycle, validity stats, causality |
+| `test_regime.py` | efficiency ratio, variance ratio, Hurst, trend/range classification |
+| `test_microstructure.py` | velocity, imbalance, bursts, tick autocorrelation |
+| `test_decision.py` | weighted voting, EV gate, every NO TRADE condition, reliability weights |
+| `test_intelligence.py` | intelligence read shape, causality, and the random-walk negative control |
+| `test_features_v2.py` | feature shape/uniqueness, label correctness, causality, random-walk control |
 
 ## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
 
@@ -671,3 +688,53 @@ downtrend from the market-qx feed.
 - Asset symbols need the `_otc` suffix for OTC markets (e.g. `EURUSD_otc`).
 - Cloudflare/geo restrictions may change over time; the WS feed is the stable
   part.
+
+## Market intelligence layer (2026-11-07)
+
+An analysis layer above the existing engines. It **detects and measures** the
+concepts (structure, liquidity, zones, regime, microstructure) and feeds them to
+a decision layer — it does not add a trading strategy and makes no profitability
+claim. Everything is causal (index `i` uses candles `[0..i]` only), and each
+module has a causality test that would fail on a look-ahead bug.
+
+What each module answers:
+
+- `structure.py` — swings and HH/HL/LH/LL; **BOS** (continuation), **CHoCH**
+  (flip), **MSS** (CHoCH + displacement). Requires a *close* beyond the level,
+  never a wick alone. `structure_series()` is the O(n) causal form for features.
+- `liquidity.py` — equal-high/low **pools** (clustered, ranked by touches),
+  **sweep + reclaim** with ATR-normalised penetration, **displacement**, and
+  session levels (meaningful for real pairs; on 24/7 OTC the sessions converge).
+- `zones.py` — order blocks and FVGs **plus a measured validity**: `zone_state`
+  is exclusive (violated *or* respected, never both), and
+  `zone_validity_stats().respect_rate` is the number to compare against the 0.5
+  baseline. A zone type that respects ~50% carries no information.
+- `regime.py` — trend (ADX + efficiency ratio + EMA slope), volatility bucket,
+  **variance ratio** and **Hurst** (trending vs mean-reverting vs random walk),
+  session. `trend_following_ok` / `mean_reversion_ok` gate a strategy on regime.
+- `microstructure.py` — tick velocity, acceleration, burst detection, imbalance
+  and lag-1 autocorrelation. Honest note: the tick direction flag was already
+  found uninformative (≈49.7%); this re-measures rather than assumes.
+- `decision.py` — `reliability_weights()` weights each engine by its measured
+  out-of-sample hit-rate (unproven engines get ~0), and `decide()` returns
+  **NO TRADE** on regime-undefined, bad data, engine conflict, or EV below the
+  payout-adjusted breakeven. Fewer, better signals — or none.
+- `intelligence.py` — the per-candle read, surfaced at `GET /api/intel`.
+
+### Honest validation of the v2 features (`ml_validate.py`)
+
+`features_v2.py` appends 19 structure/liquidity/regime/zone features to the base
+set (46 total) and `ml_validate.py` judges them with purged walk-forward,
+permutation importance, and the random-walk control.
+
+Measured (2026-11-07, payout 0.85, breakeven 54.05%):
+
+- **Random-walk control: no edge** — acc 50.1% vs baseline 50.7%, edge −0.006,
+  hit 50.1% CI[47.8, 52.5]. The pipeline does not manufacture signal from noise.
+- **Real OTC 60s data: no edge found** — per-pair acc at or below baseline,
+  verdict INDISTINGUISHABLE or BELOW. The extra features did **not** beat the
+  baseline on this data.
+
+That is the correct, honest outcome: the tooling now *proves* the absence of an
+edge instead of inventing one. Re-run `ml_validate.py` after collecting days of
+history; do not tune on these small per-pair samples.

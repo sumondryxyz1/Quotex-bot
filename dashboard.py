@@ -27,6 +27,7 @@ from urllib.parse import urlparse, parse_qs
 from analysis import analyze, analyze_smart, analyze_ensemble
 from candle_store import CandleStore, MultiFeed, PERIODS, TIMEFRAMES, asset_catalog
 from journal import Journal, settle_open, summary as journal_summary
+from payout import DEFAULT_PAYOUT
 
 PAGE = """<!doctype html>
 <html lang="en"><head>
@@ -595,6 +596,36 @@ class Handler(BaseHTTPRequestHandler):
             out = res.__dict__
             if res.enough and candles:
                 out.update(entry_plan(period, candles[-1][0], time.time(), expiry))
+            return self._json(out)
+        if u.path == "/api/intel":
+            q = parse_qs(u.query)
+            default = self.hub.assets[0] if self.hub.assets else ""
+            asset = (q.get("asset") or [default])[0]
+            try:
+                period = int((q.get("period") or [self.hub.periods[0]])[0])
+            except ValueError:
+                period = self.hub.periods[0]
+            try:
+                payout = float((q.get("payout") or [str(DEFAULT_PAYOUT)])[0])
+            except ValueError:
+                payout = DEFAULT_PAYOUT
+            candles = self.hub.feed.candles(asset, period) if self.hub.feed else []
+            if not candles:
+                candles = self.hub.store.load(asset, period, limit=400)
+            from intelligence import analyse as intel_analyse
+            from decision import decide
+            from provenance import classify_source
+            intel = intel_analyse(candles, len(candles) - 1, asset, period)
+            if intel is None:
+                return self._json({"asset": asset, "period": period,
+                                   "error": "not enough candles"})
+            out = intel.as_dict()
+            decision = decide(
+                intel.votes, asset=asset, period=period,
+                source=classify_source(asset), now=int(candles[-1][0]),
+                payout=payout,
+                regime_defined=bool(intel.regime.get("defined", True)))
+            out["decision"] = decision.as_dict()
             return self._json(out)
         if u.path == "/api/state":
             q = parse_qs(u.query)
