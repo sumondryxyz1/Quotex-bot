@@ -153,6 +153,7 @@ def main():
     ap.add_argument("--compare", action="store_true", help="old vs smart engine")
     ap.add_argument("--limit", type=int, default=0, help="max pairs (0 = all)")
     ap.add_argument("--control", action="store_true", help="add a random baseline")
+    ap.add_argument("--ensemble", action="store_true", help="add the 3-model ensemble")
     args = ap.parse_args()
 
     store = CandleStore(args.db)
@@ -180,6 +181,9 @@ def main():
     if args.compare:
         from smart_engine import SmartEngine, SmartStrategy
         engines.append(("smart", lambda a: SmartEngine(SmartStrategy())))
+    if args.ensemble:
+        from ensemble import EnsembleEngine, EnsembleStrategy
+        engines.append(("ensemble", lambda a: EnsembleEngine(EnsembleStrategy())))
     if args.control:
         engines.append(("random", lambda a: RandomEngine()))
 

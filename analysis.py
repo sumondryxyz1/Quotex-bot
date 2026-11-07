@@ -64,6 +64,37 @@ def analyze_smart(asset: str, period: int, candles: list[list],
     return res
 
 
+def analyze_ensemble(asset: str, period: int, candles: list[list],
+                     strategy=None) -> Analysis:
+    """Three-model confluence analysis (SMC + trend + momentum).
+
+    Uses `ensemble.EnsembleEngine`. Same `Analysis` shape as the others so the
+    dashboard can render it; `values` carries the per-model votes.
+    """
+    from ensemble import EnsembleEngine, EnsembleStrategy
+
+    eng = EnsembleEngine(strategy or EnsembleStrategy())
+    res = Analysis(asset=asset, period=period, candles=len(candles),
+                   enough=len(candles) >= eng.s.min_candles(), engine="ensemble")
+    if not res.enough:
+        need = eng.s.min_candles()
+        res.note = (f"need {need} candles, have {len(candles)} — "
+                    f"let it stream for {(need - len(candles)) * period}s more")
+        return res
+
+    sig = eng.evaluate(candles)
+    if sig is None:
+        res.note = "no setup: fewer than 2 of 3 models agree with the trend"
+        return res
+    res.action = sig.action
+    res.confidence = sig.confidence
+    res.score = sig.score
+    res.reasons = sig.reasons
+    res.values = {"price": sig.price, "last_candle_time": sig.time,
+                  "votes": sig.votes}
+    return res
+
+
 def analyze(asset: str, period: int, candles: list[list],
             strategy: Optional[Strategy] = None, threshold: int = 4) -> Analysis:
     s = strategy or Strategy()

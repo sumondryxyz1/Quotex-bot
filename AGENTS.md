@@ -94,6 +94,8 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `journal.py` | live signal journal: logs every signal and settles it win/loss on the real close |
 | `selective.py` | sweeps selectivity knobs (threshold/regime/vol/MTF) to see if precision improves |
 | `golive.py` | demo→real readiness gate + paper account (never trades) |
+| `smc.py` | Smart Money Concepts primitives: swings, structure, liquidity sweep, order block, FVG |
+| `ensemble.py` | 3-model confluence engine (SMC + trend + momentum, ≥2 agree + trend gate) |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -112,6 +114,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_research.py` | research harness: scoring, horizon, flat/dead filters |
 | `test_selective.py` | selectivity helpers: wilson, regime, MTF trend, ATR |
 | `test_golive.py` | paper account + go-live gate criteria |
+| `test_ensemble.py` | SMC primitives + 3-model ensemble (trend gate, ≥2 votes) |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -337,6 +340,36 @@ not find a better subset — it just fires less.
 Practical takeaway: the only honest way to cut wrong signals on this feed is to
 fire *less often*, not to fire *better* — and even that does not change the odds
 per signal. Do not sell a "high-confidence" filter as an accuracy win.
+
+### 7. SMC + trend + momentum confluence — still no edge (2026-11-07)
+
+`ensemble.py` is the setup you asked for: three independent models each vote
+CALL/PUT/abstain on the last closed candle — **SMC** (liquidity sweep, order
+block, fair value gap, market structure, premium/discount), **trend** (EMA stack,
+also a *hard* gate so a counter-trend signal is dropped), and **momentum** (MACD
+hist + RSI slope + stochastic turn). A signal needs ≥2 of 3 to agree, in the
+trend's direction.
+
+Measured on the held-out last 40% of every OTC pair:
+
+    60s  agree=2 trend-gate   n=830   hit 48.0%  CI[44.6,51.4]  p=0.24
+    60s  agree=2 no gate      n=951   hit 50.6%  CI[47.4,53.7]  p=0.72
+    60s  agree=3 trend-gate   n=347   hit 51.0%  CI[45.8,56.2]  p=0.71
+    15s  agree=2 trend-gate   n=3264  hit 51.5%  CI[49.8,53.2]  p=0.09
+    15s  agree=3 trend-gate   n=1501  hit 50.5%  CI[48.0,53.0]  p=0.70
+
+Every variant sits at 48–51.5%, every CI straddles the 54.1% breakeven, no
+p-value is significant. Requiring more agreement (3/3) does not raise the
+hit-rate — it only shrinks the sample. The trend gate does not help either.
+
+Conclusion: confluence is a *presentation* filter, not an edge. Three models
+agreeing on a random walk still predicts a coin flip. This is the same result as
+the threshold sweep (§6) and the 49-hypothesis study (§4), now confirmed on a
+genuinely different, structure-based rule set. Do not expect SMC to fix it.
+
+`ensemble` is wired into `backtest.py --ensemble`, `edge.py --engine ensemble`,
+`scan.py --engine ensemble`, and the dashboard engine selector, so it can be
+compared live and on the journal.
 
 ### What this means
 

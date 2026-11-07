@@ -24,7 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from analysis import analyze
+from analysis import analyze, analyze_smart, analyze_ensemble
 from candle_store import CandleStore, MultiFeed, PERIODS, TIMEFRAMES, asset_catalog
 from journal import Journal, settle_open, summary as journal_summary
 
@@ -107,6 +107,7 @@ PAGE = """<!doctype html>
         <select id="engine">
           <option value="rule">Rule (indicator votes)</option>
           <option value="smart">Smart (regime + volatility)</option>
+          <option value="ensemble">Ensemble (SMC + trend + momentum)</option>
         </select>
       </div>
       <button id="go">Analyze</button>
@@ -455,11 +456,12 @@ class Hub:
             try:
                 now = int(time.time())
                 settle_open(self.journal, self.store, now)
-                rep = scan_all(self.store, self.periods, "rule", top=0)
-                for row in rep["signals"]:
-                    cs = self.store.load(row["asset"], row["period"], limit=2)
-                    row["price"] = cs[-1][2] if cs else 0.0
-                    self.journal.add(row, "rule", now)
+                for engine in ("rule", "ensemble"):
+                    rep = scan_all(self.store, self.periods, engine, top=0)
+                    for row in rep["signals"]:
+                        cs = self.store.load(row["asset"], row["period"], limit=2)
+                        row["price"] = cs[-1][2] if cs else 0.0
+                        self.journal.add(row, engine, now)
             except Exception as exc:  # never let the journal kill the feed
                 print("journal loop error:", exc, flush=True)
 
@@ -588,6 +590,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 expiry = 1
             res = (analyze_smart(asset, period, candles) if engine == "smart"
+                   else analyze_ensemble(asset, period, candles) if engine == "ensemble"
                    else analyze(asset, period, candles))
             out = res.__dict__
             if res.enough and candles:

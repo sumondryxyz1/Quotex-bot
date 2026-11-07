@@ -27,7 +27,7 @@ import json
 import os
 import time
 
-from analysis import analyze, analyze_smart
+from analysis import analyze, analyze_smart, analyze_ensemble
 from candle_store import CandleStore, PERIODS
 
 PERIOD_LABEL = {5: "5s", 15: "15s", 30: "30s", 60: "1m",
@@ -99,7 +99,7 @@ def scan_all(store: CandleStore, periods: list[int], engine: str = "rule",
     `skip_dead` drops pairs whose last N candles never moved (real-market pairs
     while the market is closed). They produce only flat, meaningless signals.
     """
-    fn = analyze_smart if engine == "smart" else analyze
+    fn = analyze_smart if engine == "smart" else (analyze_ensemble if engine == "ensemble" else analyze)
     pairs = store.series(min_candles=min_candles, periods=periods)
     now = time.time()
     fired, waiting, dead = [], 0, 0
@@ -191,7 +191,7 @@ def main():
     ap.add_argument("--db", default="data/candles.db")
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--all", action="store_true", help="also list NEUTRAL rows")
-    ap.add_argument("--engine", choices=["rule", "smart"], default="rule")
+    ap.add_argument("--engine", choices=["rule", "smart", "ensemble"], default="rule")
     ap.add_argument("--min-candles", type=int, default=0,
                     help="only scan series with at least this many candles")
     ap.add_argument("--expiry", type=int, default=1, metavar="N",
