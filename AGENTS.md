@@ -93,6 +93,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `edge.py` | per-pair hit-rate vs the payout breakeven, with CI and p-value |
 | `journal.py` | live signal journal: logs every signal and settles it win/loss on the real close |
 | `selective.py` | sweeps selectivity knobs (threshold/regime/vol/MTF) to see if precision improves |
+| `golive.py` | demo→real readiness gate + paper account (never trades) |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -110,6 +111,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_journal.py` | journal settle + Wilson checks |
 | `test_research.py` | research harness: scoring, horizon, flat/dead filters |
 | `test_selective.py` | selectivity helpers: wilson, regime, MTF trend, ATR |
+| `test_golive.py` | paper account + go-live gate criteria |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -372,6 +374,29 @@ candle vs the entry close — exactly what a binary option pays on. An unchanged
 price settles `flat` (a tie, not a loss); these are almost all non-OTC pairs
 while the real market is closed. `data/journal.db` is separate from the candle
 store, so it survives independently.
+
+## Demo → real money gate (`golive.py`)
+
+The honest answer to "when can I use real money?" is: when the demo signals show
+a *measured* edge, not before. `golive.py` runs a paper account through every
+settled journal signal and checks hard criteria. It never connects to the broker
+and never places a trade — no money is at risk.
+
+Stages: `DEMO` (not enough data) → `NOT READY` (no edge) → `PAPER PASS` (edge
+shows, keep testing) → `LIVE-READY` (all gates passed; a *small* real stake is
+defensible). The dashboard shows this as the "Demo → Real money gate" card and at
+`GET /api/golive`.
+
+    python golive.py --report            # the verdict + paper equity
+    python golive.py --simulate          # just the paper curve
+    python golive.py --report --json
+
+The gate requires ALL of: ≥300 settled decisive signals, hit-rate CI lower bound
+above breakeven + 1%, p < 0.01, positive paper return, max drawdown ≤ 25%,
+consistency across ≥5 pairs, and no single pair carrying >50% of trades.
+
+At the time of writing the gate reads **DEMO/NOT READY** — exactly as it should.
+Do not bypass it; if the edge ever appears, the gate is what proves it.
 
 ## Two engines: rule vs smart
 

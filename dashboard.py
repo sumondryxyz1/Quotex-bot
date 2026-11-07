@@ -139,6 +139,16 @@ PAGE = """<!doctype html>
     <div id="jVerdict" class="mut" style="font-size:13px;margin-bottom:8px"></div>
     <div id="jPairs"></div>
   </div>
+  <div class="card" style="margin-top:16px">
+    <h3>Demo → Real money gate
+      <span class="mut" style="font-size:12px">— real money only unlocks when the edge is measured</span></h3>
+    <div class="verdict neutral" id="glBanner" style="margin-bottom:10px">
+      <div class="big" id="glStage">—</div>
+      <div class="mut" id="glSub">checking…</div>
+    </div>
+    <div id="glChecks" style="font-size:13px"></div>
+    <div id="glPaper" class="mut" style="font-size:12px;margin-top:8px"></div>
+  </div>
   <div>
     <div class="card" style="margin-bottom:16px">
       <h3>Signal</h3>
@@ -337,6 +347,35 @@ async function loadJournal(){
   }catch(e){}
 }
 setInterval(loadJournal,10000);
+async function loadGate(){
+  try{
+    const r=await fetch('/api/golive'); const g=await r.json();
+    const pc=x=>(x*100).toFixed(1)+'%';
+    const icon={DEMO:'⏳',"NOT READY":'🔴',"PAPER PASS":'🟡',"LIVE-READY":'🟢'};
+    const cls={"NOT READY":'bear',"LIVE-READY":'bull'};
+    const banner=document.getElementById('glBanner');
+    banner.className='verdict '+(cls[g.stage]||'neutral');
+    document.getElementById('glStage').textContent=(icon[g.stage]||'')+' '+g.stage;
+    const msgs={
+      DEMO:'Still collecting on demo — not enough settled signals to judge.',
+      "NOT READY":'Stay on demo. No measured edge — do not use real money.',
+      "PAPER PASS":'Promising, but keep testing on demo before risking money.',
+      "LIVE-READY":'Gate passed. A SMALL real stake is defensible; scale up slowly.'
+    };
+    document.getElementById('glSub').textContent=msgs[g.stage]||'';
+    document.getElementById('glChecks').innerHTML=(g.checks||[]).map(c=>
+      '<div style="font-variant-numeric:tabular-nums;margin:2px 0">'+
+      (c.pass?'✅':'⬜')+' '+c.name+' — <span class="mut">'+c.detail+'</span></div>').join('');
+    const p=g.paper||{};
+    if(p.trades!==undefined){
+      document.getElementById('glPaper').textContent=
+        'paper account: '+(p.start||1000).toFixed(0)+' → '+p.final+' ('+
+        (p.return_pct>=0?'+':'')+p.return_pct+'%), max DD '+p.max_drawdown_pct+
+        '%, worst losing streak '+p.worst_losing_streak+', '+p.trades+' trades';
+    }
+  }catch(e){}
+}
+setInterval(loadGate,15000);
 function tickCountdowns(){
   const now=Math.floor(Date.now()/1000);
   document.querySelectorAll('[data-in]').forEach(el=>{
@@ -370,7 +409,7 @@ function draw(cs,form){
     g.fillRect(x-bw/2, Math.min(yo,yc), bw, Math.max(1,Math.abs(yc-yo)));
   });
 }
-boot(); window.addEventListener('resize',()=>{});
+boot(); loadJournal(); loadGate(); window.addEventListener('resize',()=>{});
 </script></body></html>"""
 
 
@@ -505,6 +544,20 @@ class Handler(BaseHTTPRequestHandler):
             from scan import parse_periods, scan_all
             rep = scan_all(self.hub.store, parse_periods(spec), engine, top=top)
             return self._json(rep)
+        if u.path == "/api/golive":
+            q = parse_qs(u.query)
+            try:
+                payout = float((q.get("payout") or ["0.85"])[0])
+            except ValueError:
+                payout = 0.85
+            try:
+                min_n = int((q.get("min_n") or ["300"])[0])
+            except ValueError:
+                min_n = 300
+            if self.hub.journal is None:
+                return self._json({"stage": "disabled", "checks": [], "paper": {}})
+            from golive import gate
+            return self._json(gate(self.hub.journal, payout, min_n))
         if u.path == "/api/journal":
             q = parse_qs(u.query)
             asset = (q.get("asset") or [""])[0]
