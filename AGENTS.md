@@ -100,6 +100,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `ai_ensemble.py` | train 3 model families (GBM/RF/logit), majority vote + trend gate, honest time-split score |
 | `collect_ticks.py` | collect raw ticks (price + broker direction flag) for every pair into the `ticks` table |
 | `tickflow.py` | tick order-flow features + honest edge test (does order flow predict the next candle) |
+| `invert.py` | is the signal anti-predictive? policy chosen on train, frozen, applied to test |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -121,6 +122,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_ensemble.py` | SMC primitives + 3-model ensemble (trend gate, ≥2 votes) |
 | `test_patterns.py` | chart-pattern detectors + control that AI learns a real pattern |
 | `test_tickflow.py` | tick store round-trip + order-flow feature extraction |
+| `test_invert.py` | inversion policy choice + that inverting a coin flip stays 50% |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -439,6 +441,62 @@ First 2-minute sample: the direction flag matched the tick's own price move only
 far too small to conclude anything. The collector must run for hours to days
 before `tickflow.py` can say anything real. Run `python collect_ticks.py --stats`
 to see progress.
+
+Once ~86k ticks had accumulated the tick-level questions could be answered:
+
+- **Tick sign autocorrelation is ~0.** Pooled lag-1 autocorrelation of the tick
+  price-change sign averages z = −0.12 across pairs. No tick-level momentum and
+  no tick-level reversal.
+- **The broker direction flag carries no information.** It predicted the next
+  tick's move 49.66% of the time over 85,759 ticks (z = −1.96). It is a display
+  artifact, not order flow.
+- **The "digit bias" was a float artifact.** Last-digit frequencies looked wildly
+  non-uniform (digit 0 at 4.2%, chi² = 12,042), which would matter for Quotex's
+  even/odd digit trades. Controlling for it kills the effect: digit 0 appears in
+  0.2% of *changed* prices and the other nine are flat at ~11.1% each. The bias
+  is in Python's float→string formatting, not in the feed.
+
+### 10. Is the signal *anti*-predictive? (tested — no)
+
+The live journal settled at 44.2% (p = 0.03), below a coin flip. That raised the
+obvious hope: if the signal is reliably wrong, invert it and win ~55.8%.
+`invert.py` tests this without fooling itself:
+
+1. measure the hit-rate on the first 60% of history;
+2. choose a policy on train only (invert if train is below 50% by >1 SE);
+3. freeze the policy and apply it to the last 40%.
+
+Result across engines and periods — the inversion never survives:
+
+| engine | tf | train hit | policy | test hit | 95% CI | p |
+|---|---|---|---|---|---|---|
+| rule | 60s | 46.5% | invert | 46.0% | [39.9, 52.2] | 0.204 |
+| ensemble | 60s | 50.3% | skip | 47.9% | [44.5, 51.3] | 0.235 |
+| rule | 15s | 53.2% | normal | 50.2% | [47.0, 53.4] | 0.922 |
+| smart | 15s | 47.8% | invert | 51.3% | [47.8, 54.8] | 0.473 |
+| ensemble | 15s | 50.5% | skip | 51.6% | [49.9, 53.3] | 0.063 |
+
+The 44% was not a stable anti-signal. Train and test disagree on direction, which
+is exactly what a coin flip looks like. Flipping the signals would not help.
+
+### 11. The payout is the one untested variable that matters
+
+Every calculation above assumed an 85% payout (breakeven 54.1%). But the feed
+does **not** transmit payout — it is hardcoded to 0.85 in five places. Quotex
+payouts range roughly 70–95% per pair, and the breakeven moves a lot:
+
+| payout | breakeven hit-rate |
+|---|---|
+| 70% | 58.8% |
+| 80% | 55.6% |
+| 85% | 54.1% |
+| 90% | 52.6% |
+| 95% | 51.3% |
+
+The 15s ensemble hit 51.6% — below the 85% breakeven, but *above* the 95%
+breakeven. Payout is fetched from the authenticated Quotex API (needs an SSID),
+never from this public feed, so it cannot be confirmed here. This is the honest
+limit of what the public feed allows.
 
 ### What this means
 
