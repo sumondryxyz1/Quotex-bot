@@ -1,0 +1,15 @@
+services:
+  dashboard:
+    build: .
+    # Omit `ports` on Render/Railway (they inject $PORT). Keep it for a plain
+    # `docker compose up` or a VPS with a reverse proxy.
+    ports:
+      - "12000:12000"
+    environment:
+      CANDLE_DB: /data/candles.db
+    volumes:
+      - candles:/data
+    restart: unless-stopped
+
+volumes:
+  candles:

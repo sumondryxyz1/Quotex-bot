@@ -1,0 +1,31 @@
+# Fly.io / Render / Railway config for the signal dashboard.
+#
+# Deploy on Fly.io:
+#   fly launch --no-deploy      # accept the existing Dockerfile
+#   fly volumes create candles --size 1
+#   fly deploy
+#
+# The public URL (https://<app>.fly.dev) is permanent and stays the same across
+# every redeploy. Attach the volume so candle history survives restarts.
+
+[build]
+
+[env]
+  CANDLE_DB = "/data/candles.db"
+
+[http_service]
+  internal_port = 12000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 200
+    hard_limit = 250
+
+# Candle history lives on the volume, so it is not lost when the machine stops.
+[[mounts]]
+  source = "candles"
+  destination = "/data"

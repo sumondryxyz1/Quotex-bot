@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+out/
+.git/
+.gitignore
+test_*.py
+AGENTS.md
+DEPLOY.md
