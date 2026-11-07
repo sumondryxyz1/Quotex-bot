@@ -255,6 +255,27 @@ Two things that bite in production:
 `dashboard.py` reads `$PORT` and `$CANDLE_DB`, so PaaS providers that inject a
 port work without changes.
 
+## Honest evaluation: signals have no measured edge
+
+`edge.py` walks each (pair, timeframe) forward and scores signals against the
+next candle, reporting hit-rate + 95% CI + binomial p-value per pair. A binary
+option breaks even at `1/(1+payout)` — ~54.1% at 85% payout, ~52.6% at 90%.
+
+Measured on the collected data (5s, smart engine, 62 pairs):
+
+- **0 of 62 pairs** have a CI lower bound above the payout breakeven.
+- Hit-rates cluster around 40–48% — i.e. at or below a coin flip.
+- ~3 pairs sat at p<0.05 below 50%, which is exactly the false-positive count
+  expected from testing 62 pairs, so even those are noise, not "inverted edge".
+
+`backtest.py --compare` says the same: rule ~47.5% (p=0.44), smart ~53.4%
+(p=0.27), random control ~46.7%. Confidence is **not** calibrated either — the
+0.7–0.8 bucket hit 50%.
+
+Conclusion: the signals are presentation, not a tradable edge. Do not trade them
+as-is. Use the dashboard for data collection and study, and re-run `edge.py`
+after collecting far more candles on longer timeframes before trusting anything.
+
 ## Two engines: rule vs smart
 
 `signal_bot.SignalEngine` (rule) counts indicator votes and fires at a fixed
