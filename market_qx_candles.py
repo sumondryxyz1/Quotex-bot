@@ -121,6 +121,7 @@ class MarketQX:
         self._stop = threading.Event()
         self._pending: Optional[str] = None
         self._tick_cb: Optional[Callable[[str, float, float], None]] = None
+        self.connected = False
 
     # ---- connection ----
     def _headers(self) -> dict:
@@ -153,6 +154,7 @@ class MarketQX:
             self.send(f'42["authorization",{json.dumps({"session": self.ssid, "isDemo": 1, "tournamentId": 0, "isFastHistory": True})}]')
         if wait_instruments:
             self.instruments_ready.wait(wait_instruments)
+        self.connected = True
         return self
 
     def _keepalive(self):
@@ -175,6 +177,8 @@ class MarketQX:
             except websocket.WebSocketTimeoutException:
                 continue
             except Exception:
+                if not self._stop.is_set():
+                    self.connected = False
                 time.sleep(0.3)
 
     def _dispatch(self, msg):
@@ -220,10 +224,15 @@ class MarketQX:
         if isinstance(data, list) and data and isinstance(data[0], list):
             for row in data:
                 if len(row) == 4 and isinstance(row[0], str):
-                    asset, ts, price, _dir = row
+                    asset, ts, price, direction = row
                     self.last_price[asset] = price
                     if self._tick_cb:
-                        self._tick_cb(asset, float(ts), float(price))
+                        # 4th field is the broker's tick direction (+1/-1/0).
+                        # Old 3-arg callbacks keep working.
+                        try:
+                            self._tick_cb(asset, float(ts), float(price), direction)
+                        except TypeError:
+                            self._tick_cb(asset, float(ts), float(price))
 
     # ---- requests ----
     def follow(self, asset: str, period: int = 60):

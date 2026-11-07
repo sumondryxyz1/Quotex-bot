@@ -98,6 +98,8 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `ensemble.py` | 3-model confluence engine (SMC + trend + momentum, ≥2 agree + trend gate; `--patterns` adds a 4th chart-pattern vote) |
 | `patterns.py` | classical chart patterns: H&S, double top/bottom, triangles, S/R price action, flag |
 | `ai_ensemble.py` | train 3 model families (GBM/RF/logit), majority vote + trend gate, honest time-split score |
+| `collect_ticks.py` | collect raw ticks (price + broker direction flag) for every pair into the `ticks` table |
+| `tickflow.py` | tick order-flow features + honest edge test (does order flow predict the next candle) |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -118,6 +120,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_golive.py` | paper account + go-live gate criteria |
 | `test_ensemble.py` | SMC primitives + 3-model ensemble (trend gate, ≥2 votes) |
 | `test_patterns.py` | chart-pattern detectors + control that AI learns a real pattern |
+| `test_tickflow.py` | tick store round-trip + order-flow feature extraction |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -415,6 +418,27 @@ learn — the model is not the problem, the data is.
 Conclusion: patterns and trained AI are the same story as indicators, thresholds,
 SMC and confluence. Random walk in, coin flip out. The bottleneck is the data,
 not the method.
+
+### 9. Tick order-flow — the last untested data layer (in progress)
+
+Every test so far used **candles**, which discard two things the feed actually
+sends: the broker's per-tick direction flag (4th field of the tick frame) and
+the exact timing of each price change. That order flow is the only data axis not
+yet tested, so it is now collected.
+
+- `collect_ticks.py` subscribes to every pair and stores raw `(asset, ts, price,
+  dir)` rows in the `ticks` table (`candle_store.CandleStore.save_ticks`).
+  `MultiFeed` buffers ticks and flushes every 5s so SQLite never blocks the feed.
+  It reconnects on drop and runs for days.
+- `tickflow.py` turns a candle's ticks into 8 order-flow features (tick count,
+  up ratio, direction ratio, realised volatility, range, close position, big-tick
+  ratio, open gap) and tests them with the same 60/40 time split.
+
+First 2-minute sample: the direction flag matched the tick's own price move only
+43.7–48.3% of the time and predicted the next tick 42.7–60.2% on ~120 ticks —
+far too small to conclude anything. The collector must run for hours to days
+before `tickflow.py` can say anything real. Run `python collect_ticks.py --stats`
+to see progress.
 
 ### What this means
 

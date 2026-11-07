@@ -45,6 +45,14 @@ class CandleStore:
                    asset TEXT, period INTEGER, time INTEGER,
                    open REAL, close REAL, high REAL, low REAL,
                    PRIMARY KEY(asset, period, time))""")
+        # Raw ticks, not aggregated. This is the only data with a chance of
+        # order-flow structure: the feed sends one row per price change with the
+        # broker's tick direction, which the candle table throws away.
+        self._db.execute(
+            """CREATE TABLE IF NOT EXISTS ticks(
+                   asset TEXT, ts REAL, price REAL, dir INTEGER)""")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS ticks_asset_ts ON ticks(asset, ts)")
         self._db.commit()
         self._total = self._db.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
 
@@ -61,6 +69,34 @@ class CandleStore:
     @property
     def total(self) -> int:
         return self._total
+
+    def save_ticks(self, rows: Iterable[tuple]):
+        """Persist raw (asset, ts, price, dir) ticks. Batched by the caller."""
+        rows = list(rows)
+        if not rows:
+            return
+        with self._lock:
+            self._db.executemany("INSERT INTO ticks VALUES(?,?,?,?)", rows)
+            self._db.commit()
+
+    def load_ticks(self, asset: str, limit: int = 100000) -> list[tuple]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT ts,price,dir FROM ticks WHERE asset=? "
+                "ORDER BY ts DESC LIMIT ?", (asset, limit)).fetchall()
+        return [tuple(r) for r in reversed(rows)]
+
+    def tick_count(self, asset: Optional[str] = None) -> int:
+        with self._lock:
+            if asset:
+                return self._db.execute(
+                    "SELECT COUNT(*) FROM ticks WHERE asset=?", (asset,)).fetchone()[0]
+            return self._db.execute("SELECT COUNT(*) FROM ticks").fetchone()[0]
+
+    def tick_assets(self) -> list[str]:
+        with self._lock:
+            return [r[0] for r in self._db.execute(
+                "SELECT DISTINCT asset FROM ticks ORDER BY asset").fetchall()]
 
     def load(self, asset: str, period: int, limit: int = 5000) -> list[list]:
         with self._lock:
@@ -146,6 +182,14 @@ class MultiFeed:
                 self.history[(a, p)] = store.load(a, p, limit=5000)
                 self._builders[(a, p)] = CandleBuilder(p, on_closed=self._cb(a, p))
 
+        # Raw ticks are buffered and flushed in batches: one INSERT per tick
+        # would serialize the whole feed on SQLite.
+        self._tick_buf: list[tuple] = []
+        self._tick_lock = threading.Lock()
+        self.ticks_saved = 0
+        self._flusher = threading.Thread(target=self._flush_loop, daemon=True)
+        self._flusher.start()
+
         self.qx.on_tick(self._on_tick)
         for a in self.assets:
             self.qx.follow(a, self.periods[0])
@@ -162,10 +206,27 @@ class MultiFeed:
                 self.on_closed(asset, period, candle)
         return handler
 
-    def _on_tick(self, asset: str, ts: float, price: float):
+    def _flush_loop(self):
+        while True:
+            time.sleep(5)
+            with self._tick_lock:
+                if not self._tick_buf:
+                    continue
+                batch, self._tick_buf = self._tick_buf, []
+            self.store.save_ticks(batch)
+            self.ticks_saved += len(batch)
+
+    def _on_tick(self, asset: str, ts: float, price: float, direction=None):
         if asset not in self._asset_set:
             return
         self.last_price[asset] = price
+        d = 0
+        try:
+            d = int(direction)
+        except (TypeError, ValueError):
+            d = 0
+        with self._tick_lock:
+            self._tick_buf.append((asset, float(ts), float(price), d))
         for p in self.periods:
             self._builders[(asset, p)].add(ts, price)
         if self.on_tick:
