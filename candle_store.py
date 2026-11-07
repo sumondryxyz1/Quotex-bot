@@ -22,6 +22,7 @@ from collections import defaultdict
 from typing import Callable, Iterable, Optional
 
 from market_qx_candles import CandleBuilder, MarketQX
+from provenance import FEED_ID, classify_source
 
 # timeframes offered in the UI (seconds -> label)
 TIMEFRAMES = [
@@ -53,16 +54,57 @@ class CandleStore:
                    asset TEXT, ts REAL, price REAL, dir INTEGER)""")
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS ticks_asset_ts ON ticks(asset, ts)")
+        # Provenance: which universe a row belongs to (otc / real / synthetic)
+        # and which feed wrote it. Added after the fact, so existing databases
+        # are migrated and backfilled rather than recreated.
+        self._migrate_provenance()
         self._db.commit()
         self._total = self._db.execute("SELECT COUNT(*) FROM candles").fetchone()[0]
 
-    def save(self, asset: str, period: int, candles: Iterable[list]):
-        rows = [(asset, period, c[0], c[1], c[2], c[3], c[4]) for c in candles]
+    def _migrate_provenance(self):
+        """Add source/feed_id columns if missing, and backfill existing rows."""
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(candles)")}
+        added = False
+        if "source" not in cols:
+            self._db.execute("ALTER TABLE candles ADD COLUMN source TEXT")
+            added = True
+        if "feed_id" not in cols:
+            self._db.execute("ALTER TABLE candles ADD COLUMN feed_id TEXT")
+            added = True
+        tcols = {r[1] for r in self._db.execute("PRAGMA table_info(ticks)")}
+        if "source" not in tcols:
+            self._db.execute("ALTER TABLE ticks ADD COLUMN source TEXT")
+        if "feed_id" not in tcols:
+            self._db.execute("ALTER TABLE ticks ADD COLUMN feed_id TEXT")
+        if added:
+            # Backfill from the symbol, so old rows carry a real provenance tag.
+            rows = self._db.execute(
+                "SELECT DISTINCT asset FROM candles WHERE source IS NULL").fetchall()
+            for (asset,) in rows:
+                self._db.execute(
+                    "UPDATE candles SET source=?, feed_id=? WHERE asset=? AND source IS NULL",
+                    (classify_source(asset), FEED_ID, asset))
+            trows = self._db.execute(
+                "SELECT DISTINCT asset FROM ticks WHERE source IS NULL").fetchall()
+            for (asset,) in trows:
+                self._db.execute(
+                    "UPDATE ticks SET source=?, feed_id=? WHERE asset=? AND source IS NULL",
+                    (classify_source(asset), FEED_ID, asset))
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS candles_source ON candles(source, period)")
+
+    def save(self, asset: str, period: int, candles: Iterable[list],
+             source: Optional[str] = None, feed_id: str = FEED_ID):
+        src = source or classify_source(asset)
+        rows = [(asset, period, c[0], c[1], c[2], c[3], c[4], src, feed_id)
+                for c in candles]
         if not rows:
             return
         with self._lock:
             cur = self._db.executemany(
-                "INSERT OR IGNORE INTO candles VALUES(?,?,?,?,?,?,?)", rows)
+                "INSERT OR IGNORE INTO candles"
+                "(asset,period,time,open,close,high,low,source,feed_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?)", rows)
             self._db.commit()
             self._total += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
@@ -72,11 +114,15 @@ class CandleStore:
 
     def save_ticks(self, rows: Iterable[tuple]):
         """Persist raw (asset, ts, price, dir) ticks. Batched by the caller."""
-        rows = list(rows)
+        rows = [(r[0], r[1], r[2], r[3],
+                 r[4] if len(r) > 4 else classify_source(r[0]),
+                 r[5] if len(r) > 5 else FEED_ID) for r in rows]
         if not rows:
             return
         with self._lock:
-            self._db.executemany("INSERT INTO ticks VALUES(?,?,?,?)", rows)
+            self._db.executemany(
+                "INSERT INTO ticks(asset,ts,price,dir,source,feed_id) "
+                "VALUES(?,?,?,?,?,?)", rows)
             self._db.commit()
 
     def load_ticks(self, asset: str, limit: int = 100000) -> list[tuple]:

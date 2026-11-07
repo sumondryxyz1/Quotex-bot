@@ -100,6 +100,11 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `ai_ensemble.py` | train 3 model families (GBM/RF/logit), majority vote + trend gate, honest time-split score |
 | `collect_ticks.py` | collect raw ticks (price + broker direction flag) for every pair into the `ticks` table |
 | `tickflow.py` | tick order-flow features + honest edge test (does order flow predict the next candle) |
+| `provenance.py` | otc / real / synthetic separation + data-quality score (gaps, flat, spikes) |
+| `payout.py` | configurable payout (no hardcoded 0.85); breakeven + EV helpers |
+| `validation.py` | purged walk-forward + embargo + payout-adjusted metrics; coin-flip control |
+| `power.py` | sample-size / statistical-power calculator (how much data before an edge is believable) |
+| `audit_leakage.py` | look-ahead & leakage audit (future-permutation, causality, fold disjointness, control) |
 | `invert.py` | is the signal anti-predictive? policy chosen on train, frozen, applied to test |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
@@ -124,6 +129,54 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_tickflow.py` | tick store round-trip + order-flow feature extraction |
 | `test_invert.py` | inversion policy choice + that inverting a coin flip stays 50% |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
+| `test_provenance.py` | source classification, quality score, store migration/backfill |
+| `test_payout.py` | breakeven/EV/profit-factor known values + config precedence |
+| `test_power.py` | sample-size math (inverse-normal, monotonicity, order of magnitude) |
+| `test_validation.py` | stats, folds+embargo, metrics verdicts, random-walk negative control, injected-edge positive control |
+| `test_leakage.py` | each audit check passes clean and FAILS on a deliberately leaky detector |
+
+## P0/P1 — provenance, payout, and the validation harness (2026-11-07)
+
+First two phases of `UPGRADE_PLAN.md`. No strategy was changed; this is the
+foundation every later phase must be measured against.
+
+**Provenance (`provenance.py`, `candle_store.py`).** Every candle and tick row
+now carries `source` (`otc` / `real` / `synthetic`) and `feed_id`. Existing
+databases are migrated in place (`ALTER TABLE ADD COLUMN`) and backfilled from the
+symbol, so nothing is lost. `provenance.quality()` scores a series on gaps,
+frozen candles and robust (median/MAD) spikes; a series that fails is not fed to
+training or signals. On the live store, 5s data shows a ~44% gap ratio and the
+real (non-OTC) pairs are 100% flat while the market is closed — exactly what the
+quality flag is for.
+
+**Payout (`payout.py`).** The hardcoded `0.85` is now one configurable place
+(`payout.json`, user-supplied). `breakeven()`, `expected_value()` and
+`profit_factor()` are the single source of truth for every expectancy figure.
+
+**Validation harness (`validation.py`).** Purged walk-forward with an embargo,
+scoring the next candle close-to-close (the same rule the journal uses). Every
+metric is payout-adjusted and reports a Wilson CI, p-value, profit factor and
+drawdown. OTC / real / synthetic are never pooled. A built-in coin-flip control
+is the null. `power.py` says how many signals a given edge needs — a 55% hit-rate
+vs the 54.05% breakeven needs **~22,000** decisive signals at 80% power.
+
+**Leakage audit (`audit_leakage.py`).** Future-permutation (shuffle the future,
+the present output must not change), feature causality, fold disjointness, label
+overlap, a pooling guard, and the coin-flip control. It is itself tested against
+a deliberately leaky detector, so a PASS means something.
+
+**First real result (rule engine, 5s, 3 OTC pairs, 15 folds, 262 OOS trades):**
+hit 54.58%, CI [48.53, 60.50], EV +0.0097, p=0.138, **verdict INDISTINGUISHABLE**.
+Not an edge — the CI straddles the 54.05% breakeven. The leakage audit is 7/7
+clean on the same data. This is the honest starting point for the later phases.
+
+```bash
+python provenance.py --db data/candles.db --period 5
+python payout.py --show
+python validation.py --db data/candles.db --period 5 --engine rule --source otc --control
+python audit_leakage.py --db data/candles.db --period 60
+python power.py --payout 0.85 --hit 0.55
+```
 
 ## AI up/down bot
 
