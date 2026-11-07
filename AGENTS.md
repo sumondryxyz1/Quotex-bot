@@ -92,6 +92,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `randomwalk.py` | autocorrelation / variance-ratio diagnostics (is the feed predictable at all?) |
 | `edge.py` | per-pair hit-rate vs the payout breakeven, with CI and p-value |
 | `journal.py` | live signal journal: logs every signal and settles it win/loss on the real close |
+| `selective.py` | sweeps selectivity knobs (threshold/regime/vol/MTF) to see if precision improves |
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
@@ -108,6 +109,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `test_scan.py` | scan / entry-plan checks |
 | `test_journal.py` | journal settle + Wilson checks |
 | `test_research.py` | research harness: scoring, horizon, flat/dead filters |
+| `test_selective.py` | selectivity helpers: wilson, regime, MTF trend, ATR |
 | `test_ai_bot.py` | out-of-sample evaluation of the live prediction path |
 
 ## AI up/down bot
@@ -313,6 +315,26 @@ Both `research.py` and `edge.py` now filter by `--kind {all,otc,real}` and drop
 dead pairs (`--max-flat`). Note the real (non-OTC) pairs are completely frozen
 while the market is closed — flat rate 1.00 — so any test on them is meaningless
 until market hours. Only the `_otc` (synthetic, always-on) pairs move 24/7.
+
+### 6. Fewer wrong signals? Selectivity does not help (2026-11-07)
+
+`selective.py` sweeps every knob that makes the rule engine *quieter* — threshold
+2→8, trend-regime agreement, an ATR volatility gate (skip the flattest half), and
+multi-timeframe confluence (5s signal must agree with the 1m EMA trend) — and
+reports precision on the held-out last 40%.
+
+Result: **nothing lowers the wrong-signal rate.** Raising the threshold only
+shrinks the sample; the hit-rate stays ~50–53% and the CI always straddles the
+54.1% breakeven. Adding the regime, volatility, or MTF filter makes it *slightly
+worse* (52.9% → 52.2% with MTF, → 51.2% with the vol gate). Being pickier does
+not find a better subset — it just fires less.
+
+    python selective.py --period 60 --kind otc          # full sweep
+    python selective.py --period 5 --limit 20 --mtf 60  # MTF confluence test
+
+Practical takeaway: the only honest way to cut wrong signals on this feed is to
+fire *less often*, not to fire *better* — and even that does not change the odds
+per signal. Do not sell a "high-confidence" filter as an accuracy win.
 
 ### What this means
 
