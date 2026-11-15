@@ -127,6 +127,7 @@ So: real broker feed, real-time, but OTC prices are broker-synthetic. Run
 | `scan.py` | scan **all pairs** (one/several/all timeframes); shared `scan_all()` |
 | `alerts.py` | Telegram alerts on new signals (stdlib only) |
 | `run_dashboard.sh` | starts the dashboard on the public work host |
+| `watchdog.sh` | supervises the dashboard: restarts it if it dies, keeps one instance |
 | `run_alerts.sh` | starts the Telegram alert watcher |
 | `collect_data.py` | records live candles to a CSV (resumable) |
 | `features.py` | turns candles into the model's feature vector |
@@ -238,7 +239,8 @@ predictable signal.
 ## Live web dashboard (multi-pair, multi-timeframe)
 
 ```bash
-./run_dashboard.sh                        # all 92 pairs x 8 timeframes
+./watchdog.sh                             # recommended: keeps it running (all pairs x 8 timeframes)
+./run_dashboard.sh                        # one-shot start, dies on container restart
 ./run_dashboard.sh EURUSD_otc,BTCUSD_otc  # only these pairs
 ./run_dashboard.sh EURUSD_otc,BTCUSD_otc 60,300
 ```
@@ -395,13 +397,20 @@ so it changes when the pod is recreated — it is not permanent. To get a stable
 `docker-compose.yml`, and `fly.toml` are provided; `./run_docker.sh` runs it
 locally. See `DEPLOY.md` for the full walkthrough.
 
-Two things that bite in production:
+Three things that bite in production:
 
 - **One IP = one feed connection.** market-qx serves a single live session per
   source IP, so a second dashboard on the same host (or another container)
   silently gets `assets=0`. Stop the old one before starting the new one.
 - **`data/candles.db` is the only durable asset.** Mount a volume at `CANDLE_DB`
   (`/data` in the shipped configs) so history survives restarts and redeploys.
+- **A background process dies with the container.** Starting `dashboard.py` with
+  `nohup ... &` means a container restart leaves the public URL with no server
+  and the bot *looks* disconnected ("can't connect to the market"), even though
+  the code is fine. Run it under `./watchdog.sh` instead — it re-launches the
+  dashboard if it exits and keeps a single instance. If the page shows
+  `loading instruments…` for ~45s that is normal: the instrument list arrives
+  late (see the handshake notes above), and the UI retries until it lands.
 
 `dashboard.py` reads `$PORT` and `$CANDLE_DB`, so PaaS providers that inject a
 port work without changes.
